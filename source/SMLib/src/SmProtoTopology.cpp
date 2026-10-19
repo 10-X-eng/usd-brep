@@ -2654,9 +2654,13 @@ SmProtoEdge::~SmProtoEdge()
   for(ii=0;ii<lNumEDs;ii++) { if(m_sEdgeDefs[ii]) delete m_sEdgeDefs[ii] ; m_sEdgeDefs[ii] = NULL ; }
 
   // Remove PE from its End PV->PE lists
-  if(    m_pStartPV)              { m_pStartPV->RemoveProtoEdge(this) ; }
-  if(    m_pEndPV 
-     && (m_pEndPV != m_pStartPV)) { m_pEndPV->RemoveProtoEdge(this) ; }
+  // A closed proto-edge is registered twice at its single endpoint. Combined
+  // vertices may also contain duplicate incidences. Remove every incidence
+  // before freeing this edge, so a later vertex destructor cannot visit it.
+  if(m_pStartPV)
+    { while(m_pStartPV->RemoveProtoEdge(this) == SM_SUCCESS) {} }
+  if(m_pEndPV && m_pEndPV != m_pStartPV)
+    { while(m_pEndPV->RemoveProtoEdge(this) == SM_SUCCESS) {} }
 
   // clear contained objects
   m_pXSectInterval.Init() ;

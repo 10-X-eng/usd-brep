@@ -4877,7 +4877,7 @@ SmCurveClassification::SmCurveClassification
   // copy member values
   m_bIsCurveOwned         = crOther.m_bIsCurveOwned ;
   if(m_bIsCurveOwned && crOther.m_cpCurve != NULL) 
-    { crOther.m_cpCurve->Copy(m_cpContext ? *m_cpContext : *(m_cpCurve->GetContext()), 
+    { crOther.m_cpCurve->Copy(m_cpContext ? *m_cpContext : *(crOther.m_cpCurve->GetContext()),
                               (SmCurve *&)m_cpCurve) ;  
     }
   else                
@@ -4901,6 +4901,18 @@ SmCurveClassification::SmCurveClassification
   m_cpOtherClassification = crOther.m_cpOtherClassification ;
   m_cpFace                = crOther.m_cpFace ;
   m_cpUVCurve2            = crOther.m_cpUVCurve2 ;
+  // An owned curve-on-surface copy owns new UV geometry and possibly a new
+  // base surface. Rebind aliases into that geometry before the source dies.
+  // References to independent target surfaces/curves remain borrowed.
+  if(m_bIsCurveOwned && crOther.m_cpCurve && crOther.m_cpCurve->IsKindOf(SmCrvOnSurf_TYPE))
+    {
+      const SmCrvOnSurf *pOld = static_cast<const SmCrvOnSurf *>(crOther.m_cpCurve);
+      const SmCrvOnSurf *pNew = static_cast<const SmCrvOnSurf *>(m_cpCurve);
+      if(m_cpUVCurve1 == pOld->GetUVCurve()) m_cpUVCurve1 = pNew->GetUVCurve();
+      if(m_cpUVCurve2 == pOld->GetUVCurve()) m_cpUVCurve2 = pNew->GetUVCurve();
+      if(m_cpSurface1 == pOld->GetBaseSurface()) m_cpSurface1 = pNew->GetBaseSurface();
+      if(m_cpSurface2 == pOld->GetBaseSurface()) m_cpSurface2 = pNew->GetBaseSurface();
+    }
   m_cpTI                  = crOther.m_cpTI ;
 
 #ifdef SM_USE_NEWTOL
@@ -5029,7 +5041,7 @@ SmCurveClassification & SmCurveClassification::operator=
   // copy member values
   m_bIsCurveOwned         = crOther.m_bIsCurveOwned ;
   if(m_bIsCurveOwned && crOther.m_cpCurve != NULL) 
-    { crOther.m_cpCurve->Copy(m_cpContext ? *m_cpContext : *(m_cpCurve->GetContext()), 
+    { crOther.m_cpCurve->Copy(m_cpContext ? *m_cpContext : *(crOther.m_cpCurve->GetContext()),
                               (SmCurve *&)m_cpCurve) ;  
     }
   else                
@@ -5053,6 +5065,18 @@ SmCurveClassification & SmCurveClassification::operator=
   m_cpOtherClassification = crOther.m_cpOtherClassification ;
   m_cpFace                = crOther.m_cpFace ;
   m_cpUVCurve2            = crOther.m_cpUVCurve2 ;
+  // An owned curve-on-surface copy owns new UV geometry and possibly a new
+  // base surface. Rebind aliases into that geometry before the source dies.
+  // References to independent target surfaces/curves remain borrowed.
+  if(m_bIsCurveOwned && crOther.m_cpCurve && crOther.m_cpCurve->IsKindOf(SmCrvOnSurf_TYPE))
+    {
+      const SmCrvOnSurf *pOld = static_cast<const SmCrvOnSurf *>(crOther.m_cpCurve);
+      const SmCrvOnSurf *pNew = static_cast<const SmCrvOnSurf *>(m_cpCurve);
+      if(m_cpUVCurve1 == pOld->GetUVCurve()) m_cpUVCurve1 = pNew->GetUVCurve();
+      if(m_cpUVCurve2 == pOld->GetUVCurve()) m_cpUVCurve2 = pNew->GetUVCurve();
+      if(m_cpSurface1 == pOld->GetBaseSurface()) m_cpSurface1 = pNew->GetBaseSurface();
+      if(m_cpSurface2 == pOld->GetBaseSurface()) m_cpSurface2 = pNew->GetBaseSurface();
+    }
   m_cpTI                  = crOther.m_cpTI ;
 
 #ifdef SM_USE_NEWTOL

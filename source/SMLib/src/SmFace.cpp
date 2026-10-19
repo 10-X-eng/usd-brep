@@ -15659,6 +15659,7 @@ static ULONG lCount      = 1 ; lCount++ ;
       SmCrvOnSurf * pSeamConstU = NULL ;
 
       pSurface->CreateSeamCurve(*pContext, SM_SP_U, pSeamConstU, bPeriodicU) ;
+      SmObjDelete sSeamOwnerU(pSeamConstU) ;
 
       // build SeamU classification object
       SmCurveInterval         aDataU[20] ;
@@ -15671,7 +15672,7 @@ static ULONG lCount      = 1 ; lCount++ ;
                                                                             //      UVCurve without  cpSurface1 : 2d wire - SmTol::GetZoneTol3d(UVCurve)
                                          20,                                // in : SizeOf OptUserManaged m_pData array, default:[0]
                                          aDataU,                            // in : OptUserManaged m_pData array, default:[NULL]
-                                         TRUE,                              // in : TRUE=cpCurve is deleted by this destructor, FALSE=isn't, default:[FALSE]
+                                         FALSE,                             // owned by sSeamOwnerU until transferred to rCrvClassU
                                          TRUE,                              // in : TRUE = Edge not modified since UVTrimCurve was built, default:[TRUE]
                                          pSurface) ;                        // in : Surf of cpUVCurve, or Surf1 of surf/surf XSection that made classify curve
                                                                             // in : Surf2 of surf/surf XSection that made classify curve, default:[NULL] 
@@ -15688,7 +15689,7 @@ static ULONG lCount      = 1 ; lCount++ ;
 
       // switch pSeamConstU ownership to rCrvClassU
       rCrvClassU.SetIsCurveOwned(TRUE) ;
-      sCrvClassU.SetIsCurveOwned(FALSE) ;
+      sSeamOwnerU.Clear() ;
 
       // classify the SeamCurve3d against this face
       CurveOnClassify(FALSE,                // in : TRUE =Do expensive PtClassification for Curves not XSecting any Face->Bndrys
@@ -15803,7 +15804,7 @@ static ULONG lCount      = 1 ; lCount++ ;
       // Build SeamConstV curve
       SmCrvOnSurf * pSeamConstV = NULL ;
       pSurface->CreateSeamCurve(*pContext, SM_SP_V, pSeamConstV, bPeriodicV) ;
-     // SmObjDelete sObjCleapupCrv(pSeamConstV); // JLMCC added to attempt to address memory leak
+      SmObjDelete sSeamOwnerV(pSeamConstV) ;
 
       // build SeamV classification object
       SmCurveInterval         aDataV[20] ;
@@ -15817,7 +15818,7 @@ static ULONG lCount      = 1 ; lCount++ ;
                                                                             //      UVCurve without  cpSurface1 : 2d wire - SmTol::GetZoneTol3d(UVCurve)
                                          20,                                // in : size of opt user managed m_pData array
                                          aDataV,                            // in : opt user managed m_pData array
-                                         TRUE,                              // in : TRUE=cpCurve is deleted by this destructor, FALSE=isn't, default:[FALSE]
+                                         FALSE,                             // owned by sSeamOwnerV until transferred to rCrvClassV
                                          TRUE,                              // in : TRUE = Edge not modified since UVTrimCurve was built, default:[TRUE]
                                          pSurface) ;                        // in : Surf of cpUVCurve, or Surf1 of surf/surf XSection that produced curve to classify
                                                                             // in : Surf2 of surf/surf XSection that made classify curve, default:[NULL]
@@ -15835,7 +15836,7 @@ static ULONG lCount      = 1 ; lCount++ ;
 
       // switch pSeamConstV ownership to pCrvClassU
       rCrvClassV.SetIsCurveOwned(TRUE) ;
-      sCrvClassV.SetIsCurveOwned(FALSE) ;
+      sSeamOwnerV.Clear() ;
 
 
       // classify the SeamCurve3d against this face (works for composites)
