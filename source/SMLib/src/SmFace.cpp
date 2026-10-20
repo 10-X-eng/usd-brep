@@ -9,7 +9,12 @@
 #include "SmMath.h"
 #include "StdAfx.h"
 
+#include <algorithm>
+#include <array>
+#include <vector>
+#include <cmath>
 #include <limits>
+#include <map>
 #include <memory>
 
 #include <nurbs.h>
@@ -5608,13 +5613,173 @@ static ULONG lDebugCount = 0;
 
 } // end SmFace::ClassifyLoops
 
-/*******************************************************************//**
-PURPOSE: Pack selected properties into the nested ODE integrators.
+// Property integration uses fixed dimensional error scales. The general ODE
+// integrator's evolving accumulator scales are unsuitable for nested integrals
+// of many short trim spans: inner numerical noise can exceed the outer budget.
+struct SmPropertyGaussPoint
+{
+    double x, weight;
+};
+static constexpr SmPropertyGaussPoint sPropertyGauss4[] = {
+    { 0.33998104358485626, 0.65214515486254609 },
+    { 0.86113631159405257, 0.34785484513745385 },
+};
+static constexpr SmPropertyGaussPoint sPropertyGauss8[] = {
+    { 0.18343464249564981, 0.36268378337836199 },
+    { 0.52553240991632899, 0.31370664587788727 },
+    { 0.79666647741362673, 0.22238103445337448 },
+    { 0.96028985649753629, 0.10122853629037626 },
+};
+static constexpr SmPropertyGaussPoint sPropertyGauss16[] = {
+    { 0.095012509837637441, 0.1894506104550685 }, { 0.28160355077925892, 0.18260341504492358 },  { 0.45801677765722737, 0.16915651939500254 },
+    { 0.61787624440264377, 0.14959598881657674 }, { 0.755404408355003, 0.12462897125553388 },    { 0.86563120238783176, 0.095158511682492786 },
+    { 0.9445750230732326, 0.062253523938647894 }, { 0.98940093499164994, 0.027152459411754096 },
+};
+static constexpr SmPropertyGaussPoint sPropertyGauss32[] = {
+    { 0.048307665687738317, 0.096540088514727798 }, { 0.14447196158279649, 0.095638720079274861 }, { 0.23928736225213706, 0.093844399080804566 },
+    { 0.33186860228212767, 0.091173878695763891 },  { 0.42135127613063533, 0.087652093004403811 }, { 0.50689990893222936, 0.083311924226946749 },
+    { 0.5877157572407623, 0.078193895787070311 },   { 0.66304426693021523, 0.072345794108848505 }, { 0.73218211874028971, 0.065822222776361849 },
+    { 0.79448379596794239, 0.058684093478535544 },  { 0.84936761373256997, 0.050998059262376175 }, { 0.89632115576605209, 0.042835898022226683 },
+    { 0.93490607593773967, 0.034273862913021431 },  { 0.96476225558750639, 0.025392065309262059 }, { 0.98561151154526838, 0.01627439473090567 },
+    { 0.99726386184948157, 0.0070186100094700964 },
+};
 
-NOTES: Evaluator indices are one-based; zero means a group is not selected.
-  Component 1 always controls error. ALL preserves the historical 27-component
-  order and arithmetic, including separately integrated axial second moments.
-***********************************************************************/
+static SmStatus sm_PropertyGaussRule(
+    const SmODEIntegFuncEvalObj& crFunction,
+    double a,
+    double b,
+    const SmPropertyGaussPoint* pRule,
+    ULONG lCount,
+    ULONG lComponents,
+    SmTArray<double>& rIntegral,
+    ULONG& rBudget
+)
+{
+    rIntegral.SetSize(lComponents);
+    rIntegral.SetAll(0.0);
+    SmTArray<double> sCompensation(lComponents, NULL, lComponents);
+    sCompensation.SetAll(0.0);
+    SmTArray<double> sUnused(lComponents + 1, NULL, lComponents + 1);
+    sUnused.SetAll(0.0);
+    SmTArray<double> sValues(lComponents + 1, NULL, lComponents + 1);
+    const double dMid = a / 2.0 + b / 2.0, dHalf = (b - a) / 2.0;
+    for (ULONG i = 0; i < lCount; ++i)
+    {
+        for (double sign : { -1.0, 1.0 })
+        {
+            if (!rBudget)
+            {
+                return SM_ERR;
+            }
+            --rBudget;
+            sValues.SetAll(0.0);
+            const SmStatus evalStatus = crFunction.Evaluate(dMid + sign * dHalf * pRule[i].x, sUnused, sValues);
+            SER(evalStatus);
+            if (sValues.GetSize() != lComponents + 1)
+            {
+                return SM_ERR;
+            }
+            for (ULONG j = 0; j < lComponents; ++j)
+            {
+                if (!std::isfinite(sValues[j + 1]))
+                {
+                    return SM_ERR;
+                }
+                const double dTerm = dHalf * pRule[i].weight * sValues[j + 1] - sCompensation[j];
+                const double dTotal = rIntegral[j] + dTerm;
+                sCompensation[j] = (dTotal - rIntegral[j]) - dTerm;
+                rIntegral[j] = dTotal;
+            }
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// Local subdivisions share the caller's error budget. A tiny interval may
+// reach roundoff before meeting its proportional quota; retain its measured
+// error and let the parent check the sum, instead of demanding impossible
+// accuracy independently of the remainder of the integral.
+static SmStatus sm_PropertyGaussEstimate(
+    const SmODEIntegFuncEvalObj& crFunction,
+    double a,
+    double b,
+    double dAccuracy,
+    const SmTArray<double>& crScales,
+    SmTArray<double>& rIntegral,
+    SmTArray<double>& rErrors,
+    ULONG& rBudget,
+    ULONG lDepth = 0
+)
+{
+    const SmPropertyGaussPoint* aRules[] = { sPropertyGauss4, sPropertyGauss8, sPropertyGauss16, sPropertyGauss32 };
+    const ULONG aCounts[] = { 2, 4, 8, 16 };
+    SmTArray<double> sCoarse;
+    rErrors.SetSize(crScales.GetSize());
+    SER(sm_PropertyGaussRule(crFunction, a, b, aRules[0], aCounts[0], crScales.GetSize(), sCoarse, rBudget));
+    for (ULONG iRule = 1; iRule < 4; ++iRule)
+    {
+        SER(sm_PropertyGaussRule(crFunction, a, b, aRules[iRule], aCounts[iRule], crScales.GetSize(), rIntegral, rBudget));
+        SmBoolean bConverged = TRUE;
+        for (ULONG j = 0; j < crScales.GetSize(); ++j)
+        {
+            rErrors[j] = smos_Fabs(rIntegral[j] - sCoarse[j]);
+            if (rErrors[j] > dAccuracy * crScales[j])
+            {
+                bConverged = FALSE;
+            }
+        }
+        if (bConverged)
+        {
+            return SM_SUCCESS;
+        }
+        sCoarse = rIntegral;
+    }
+    const double dMid = a / 2.0 + b / 2.0;
+    if (lDepth >= 12 || dMid == a || dMid == b)
+    {
+        return SM_SUCCESS; // Estimates checked by caller.
+    }
+    SmTArray<double> sLeft, sRight, sLeftErrors, sRightErrors;
+    SER(sm_PropertyGaussEstimate(crFunction, a, dMid, dAccuracy / 2.0, crScales, sLeft, sLeftErrors, rBudget, lDepth + 1));
+    SER(sm_PropertyGaussEstimate(crFunction, dMid, b, dAccuracy / 2.0, crScales, sRight, sRightErrors, rBudget, lDepth + 1));
+    for (ULONG j = 0; j < crScales.GetSize(); ++j)
+    {
+        rIntegral[j] = sLeft[j] + sRight[j];
+        rErrors[j] = sLeftErrors[j] + sRightErrors[j];
+    }
+    return SM_SUCCESS;
+}
+
+static SmStatus sm_PropertyGauss(
+    const SmODEIntegFuncEvalObj& crFunction,
+    double a,
+    double b,
+    double dAccuracy,
+    const SmTArray<double>& crScales,
+    SmTArray<double>& rIntegral,
+    ULONG& rBudget
+)
+{
+    SmTArray<double> sErrors;
+    SER(sm_PropertyGaussEstimate(crFunction, a, b, dAccuracy, crScales, rIntegral, sErrors, rBudget));
+    for (ULONG j = 0; j < crScales.GetSize(); ++j)
+    {
+        if (sErrors[j] > dAccuracy * crScales[j])
+        {
+            return SM_ERR;
+        }
+    }
+    return SM_SUCCESS;
+}
+
+/*******************************************************************/ /**
+ PURPOSE: Pack selected properties into the nested quadrature evaluators.
+
+ NOTES: Evaluator indices are one-based; zero means a group is not selected.
+   Component 1 is the auxiliary area channel; volume-only requests leave it zero.
+   ALL preserves the historical 27-component
+   order and arithmetic, including separately integrated axial second moments.
+ ***********************************************************************/
 class SmPrecisePropertyLayout
 {
 public:
@@ -5627,59 +5792,195 @@ public:
     {
         m_lArea = Add(lFlags & SM_PPF_AREA,1);
         m_lVolume = Add(lFlags & SM_PPF_VOLUME,1);
-        const ULONG aMomentFlags[] = {
-            SM_PPF_AREA_FIRST_MOMENTS, SM_PPF_AREA_SECOND_MOMENTS,
-            SM_PPF_AREA_SECOND_MOMENTS, SM_PPF_AREA_SECOND_MOMENTS,
-            SM_PPF_VOLUME_FIRST_MOMENTS, SM_PPF_VOLUME_SECOND_MOMENTS,
-            SM_PPF_VOLUME_SECOND_MOMENTS, SM_PPF_VOLUME_SECOND_MOMENTS
-        };
-        for (ULONG i=0; i<8; ++i) m_aMoments[i] = Add(lFlags & aMomentFlags[i],3);
+        const ULONG aMomentFlags[] = { SM_PPF_AREA_FIRST_MOMENTS,    SM_PPF_AREA_SECOND_MOMENTS,  SM_PPF_AREA_SECOND_MOMENTS,
+                                       SM_PPF_AREA_SECOND_MOMENTS,   SM_PPF_VOLUME_FIRST_MOMENTS, SM_PPF_VOLUME_SECOND_MOMENTS,
+                                       SM_PPF_VOLUME_SECOND_MOMENTS, SM_PPF_VOLUME_SECOND_MOMENTS };
+        for (ULONG i = 0; i < 8; ++i)
+        {
+            m_aMoments[i] = Add(lFlags & aMomentFlags[i], 3);
+        }
     }
 
 private:
-    ULONG Add(ULONG lSelected,ULONG lCount)
+
+    ULONG Add(ULONG lSelected, ULONG lCount)
     {
-        if (!lSelected) return 0;
+        if (!lSelected)
+        {
+            return 0;
+        }
         const ULONG lIndex = m_lNumComponents + 1;
         m_lNumComponents += lCount;
         return lIndex;
     }
 };
 
-/*******************************************************************//**
-PURPOSE: Helper class for SmFace::ComputePreciseProperties
+static SmStatus sm_PropertySurfaceKnots(const SmSurface& surface, SmSurfParamType axis, SmTArray<double>& knots)
+{
+    SmStatus status = surface.GetKnots(axis, knots);
+    if (status == SM_ERR)
+    {
+        const auto* root = surface.GetRootSurface();
+        status = root ? root->GetKnots(axis, knots) : SM_SUCCESS;
+    }
+    return status;
+}
 
-NOTES: 
-***********************************************************************/
+// Differentiate nonrational control polygons before evaluation. Summing
+// derivative basis functions against absolute UV coordinates loses precision
+// on the short knot intervals produced by tight curve projection.
+class SmPropertyUVJet
+{
+    ULONG m_lDegree = 0;
+    std::array<std::vector<SmPoint3d>, 2> m_aPoles;
+    std::array<std::vector<double>, 2> m_aKnots;
+
+public:
+
+    SmStatus m_eStatus = SM_SUCCESS;
+    SmBoolean m_bActive = FALSE;
+    explicit SmPropertyUVJet(const SmCurve& crCurve)
+    {
+        const auto* pCurve = SM_CAST_PTR(SmBSplineCurve, &crCurve);
+        if (!pCurve || pCurve->IsRational() || !pCurve->GetDegree() || pCurve->GetDegree() > 32)
+        {
+            return;
+        }
+        SmTArray<SmPoint3d> sPoints;
+        SmTArray<double> sWeights, sKnots;
+        m_eStatus = pCurve->GetControlPolygon(sPoints, sWeights);
+        if (m_eStatus != SM_SUCCESS)
+        {
+            return;
+        }
+        m_eStatus = pCurve->GetKnotsAll(sKnots);
+        if (m_eStatus != SM_SUCCESS)
+        {
+            return;
+        }
+        m_lDegree = pCurve->GetDegree();
+        if (sKnots.GetSize() != sPoints.GetSize() + m_lDegree + 1 || sPoints.GetSize() < 2)
+        {
+            m_eStatus = SM_ERR;
+            return;
+        }
+        for (const auto& p : sPoints)
+        {
+            m_aPoles[0].push_back(p);
+        }
+        for (double t : sKnots)
+        {
+            m_aKnots[0].push_back(t);
+        }
+        m_aKnots[1].assign(m_aKnots[0].begin() + 1, m_aKnots[0].end() - 1);
+        for (ULONG i = 0; i + 1 < sPoints.GetSize(); ++i)
+        {
+            const double dDenominator = sKnots[i + m_lDegree + 1] - sKnots[i + 1];
+            m_aPoles[1].push_back(dDenominator > 0.0 ? (sPoints[i + 1] - sPoints[i]) * (m_lDegree / dDenominator) : SmVector3d(0, 0, 0));
+        }
+        m_bActive = TRUE;
+    }
+    void Evaluate(double t, SmPoint3d aValues[2]) const
+    {
+        for (ULONG order = 0; order < 2; ++order)
+        {
+            const ULONG p = m_lDegree - order;
+            const auto& knots = m_aKnots[order];
+            const auto& poles = m_aPoles[order];
+            size_t span;
+            if (t <= knots[p])
+            {
+                span = p;
+            }
+            else if (t >= knots[poles.size()])
+            {
+                span = poles.size() - 1;
+            }
+            else
+            {
+                span = std::upper_bound(knots.begin(), knots.end(), t) - knots.begin() - 1;
+            }
+            std::array<SmPoint3d, 33> work;
+            for (ULONG j = 0; j <= p; ++j)
+            {
+                work[j] = poles[span - p + j];
+            }
+            for (ULONG r = 1; r <= p; ++r)
+            {
+                for (ULONG j = p; j >= r; --j)
+                {
+                    const size_t i = span - p + j;
+                    const double denominator = knots[i + p - r + 1] - knots[i];
+                    const double alpha = denominator > 0.0 ? (t - knots[i]) / denominator : 0.0;
+                    work[j] = work[j - 1] * (1.0 - alpha) + work[j] * alpha;
+                }
+            }
+            aValues[order] = work[p];
+        }
+    }
+};
+
+/*******************************************************************/ /**
+ PURPOSE: Helper class for SmFace::ComputePreciseProperties
+
+ NOTES:
+ ***********************************************************************/
 class SmODEAreaIFEO : public SmODEIntegFuncEvalObj
 {
 private:
-    const SmSurface  & m_crSurface;
-    const SmCurve    & m_crUVCurve;
-    double             m_dMinV;
-    double             m_dIsoCurveAccuracy;
-    SmTArray<double> * m_pYScale;
-    SmPoint3d          m_vOriginOfComputation;
-    double             m_dFaceThickness;
-    const SmPrecisePropertyLayout & m_crLayout;
+
+    const SmSurface& m_crSurface;
+    const SmCurve& m_crUVCurve;
+    SmPropertyUVJet m_sUVJet;
+    double m_dMinV;
+    double m_dIsoCurveAccuracy;
+    SmTArray<double>* m_pYScale;
+    SmPoint3d m_vOriginOfComputation;
+    double m_dFaceThickness;
+    const SmPrecisePropertyLayout& m_crLayout;
+    SmTArray<double> m_sVKnots;
+    SmStatus m_eVKnotsStatus = SM_SUCCESS;
+    ULONG& m_rBudget;
+
 public:
-    SmODEAreaIFEO(const SmSurface & crSurface,
-        const SmCurve & crUVCurve, double dMinV,
-        double dIsoCurveAccuracy, SmTArray<double> * pYScale,
-        const SmPoint3d & crOriginOfComputation,
-        double dFaceThickness, const SmPrecisePropertyLayout & crLayout)
-        : m_crSurface(crSurface), m_crUVCurve(crUVCurve),
+
+    SmODEAreaIFEO(
+        const SmSurface& crSurface,
+        const SmCurve& crUVCurve,
+        double dMinV,
+        double dIsoCurveAccuracy,
+        SmTArray<double>* pYScale,
+        const SmPoint3d& crOriginOfComputation,
+        double dFaceThickness,
+        const SmPrecisePropertyLayout& crLayout,
+        ULONG& rBudget,
+        SmBoolean bUseSurfaceKnots = TRUE
+    )
+        : m_crSurface(crSurface),
+          m_crUVCurve(crUVCurve),
+          m_sUVJet(crUVCurve),
           m_dMinV(dMinV),
           m_dIsoCurveAccuracy(dIsoCurveAccuracy),
           m_pYScale(pYScale),
           m_vOriginOfComputation(crOriginOfComputation),
-          m_dFaceThickness(dFaceThickness), m_crLayout(crLayout)
-    {}
-    virtual SmStatus Evaluate(double dT,                             // in : 
-                              SmTArray<double> & rYValues,           // NotUsed: out: 
-                              SmTArray<double> & rDyDxValues) const; // out: 
+          m_dFaceThickness(dFaceThickness),
+          m_crLayout(crLayout),
+          m_rBudget(rBudget)
+    {
+        // Generic analytic surfaces may have no knots; NURBS and derived
+        // surfaces that expose knots supply their explicit smooth spans.
+        if (bUseSurfaceKnots)
+        {
+            m_eVKnotsStatus = sm_PropertySurfaceKnots(m_crSurface, SM_SP_V, m_sVKnots);
+        }
+    }
+    virtual SmStatus Evaluate(
+        double dT, // in :
+        SmTArray<double>& rYValues, // NotUsed: out:
+        SmTArray<double>& rDyDxValues
+    ) const; // out:
 
-} ; // end class SmODEAreaIFEO
+}; // end class SmODEAreaIFEO
 
 /****************************************************************
 PURPOSE:
@@ -5933,49 +6234,105 @@ PURPOSE:
 
 NOTES:
 ***********************************************************************/
-SmStatus SmODEAreaIFEO::Evaluate
-(
-  double             dT,          // in :
-  SmTArray<double> & rYValues,    // NotUsed: out:
-  SmTArray<double> & rDyDxValues  // out:
+SmStatus SmODEAreaIFEO::Evaluate(
+    double dT, // in :
+    SmTArray<double>& rYValues, // NotUsed: out:
+    SmTArray<double>& rDyDxValues // out:
 ) const
 {
-  SM_REF1(rYValues) ;
+    SM_REF1(rYValues);
     SmPoint3d sPV[2];
-    SER(m_crUVCurve.Evaluate(dT,1,TRUE,sPV));
+    SER(m_eVKnotsStatus);
+    SER(m_sUVJet.m_eStatus);
+    if (m_sUVJet.m_bActive)
+    {
+        m_sUVJet.Evaluate(dT, sPV);
+    }
+    else
+    {
+        SER(m_crUVCurve.Evaluate(dT, 1, TRUE, sPV));
+    }
 
-    SmODEIsoCurveLengthIFEO sEval(m_crSurface,sPV[0].x,m_vOriginOfComputation,m_dFaceThickness,m_crLayout);
-    SmODEIntegrator sIntegrator(sEval);
+    // The ODE solver reuses derivative buffers between evaluations. A trim
+    // tangent with zero U component contributes zero; leaving the old buffer
+    // untouched feeds a previous nonzero derivative back to the integrator.
+    rDyDxValues.SetSize(m_pYScale->GetSize() + 1);
+    rDyDxValues.SetAll(0.0);
+
+    SmODEIsoCurveLengthIFEO sEval(m_crSurface, sPV[0].x, m_vOriginOfComputation, m_dFaceThickness, m_crLayout);
+
 
 #ifdef SM_DEBUG_CODE
-SmBoolean bDebugMe = FALSE;
-    if (bDebugMe) {
+    SmBoolean bDebugMe = FALSE;
+    if (bDebugMe)
+    {
         smgfx_ChangeColor(FALSE);
-        SmIsoCurve sCrv(m_crSurface,SM_SP_U,sPV[0].x,TRUE);
+        SmIsoCurve sCrv(m_crSurface, SM_SP_U, sPV[0].x, TRUE);
         sCrv.SetContext(NULL);
-        if (smos_Fabs(sPV[0].y - m_dMinV) > SM_EFF_ZERO_SQRT) {
-            SmExtent1d sIvl(m_dMinV,sPV[0].y);
-            sCrv.DrawWDeriv(sIvl,0);
+        if (smos_Fabs(sPV[0].y - m_dMinV) > SM_EFF_ZERO_SQRT)
+        {
+            SmExtent1d sIvl(m_dMinV, sPV[0].y);
+            sCrv.DrawWDeriv(sIvl, 0);
             sm_GraphicsLoop();
         }
     }
 #endif // SM_DEBUG_CODE
 
-    if (smos_Fabs(sPV[1].x) > SM_EFF_ZERO) {
+    if (smos_Fabs(sPV[1].x) > SM_EFF_ZERO)
+    {
         const ULONG lNumComponents = m_pYScale->GetSize();
-        SmTArray<double> dY(lNumComponents,NULL,lNumComponents);
+        SmTArray<double> dY(lNumComponents, NULL, lNumComponents);
         double dStep = sPV[0].y - m_dMinV;
 
-        ULONG lNumOK, lNumBad;
-        // A failed inner integration is not a zero-area contribution; return
-        // the failure so callers cannot accept plausible partial properties.
-        SER(sIntegrator.RungeKuttaODEIntegrate(dY,m_dMinV,
-            sPV[0].y, m_dIsoCurveAccuracy, dStep/2.0, 0.0, lNumOK, lNumBad,
-            m_pYScale));
+        dY.SetAll(0.0);
+        SmTArray<double> sBreaks;
+        sBreaks.Add(m_dMinV);
+        if (dStep > 0.0)
+        {
+            for (double knot : m_sVKnots)
+            {
+                if (knot > m_dMinV && knot < sPV[0].y)
+                {
+                    sBreaks.Add(knot);
+                }
+            }
+        }
+        else
+        {
+            for (long i = long(m_sVKnots.GetSize()) - 1; i >= 0; --i)
+            {
+                if (m_sVKnots[i] < m_dMinV && m_sVKnots[i] > sPV[0].y)
+                {
+                    sBreaks.Add(m_sVKnots[i]);
+                }
+            }
+        }
+        sBreaks.Add(sPV[0].y);
+        if (dStep != 0.0)
+        {
+            for (ULONG i = 0; i + 1 < sBreaks.GetSize(); ++i)
+            {
+                SmTArray<double> sPartial;
+                SER(sm_PropertyGauss(
+                    sEval,
+                    sBreaks[i],
+                    sBreaks[i + 1],
+                    m_dIsoCurveAccuracy * smos_Fabs((sBreaks[i + 1] - sBreaks[i]) / dStep),
+                    *m_pYScale,
+                    sPartial,
+                    m_rBudget
+                ));
+                for (ULONG j = 0; j < lNumComponents; ++j)
+                {
+                    dY[j] += sPartial[j];
+                }
+            }
+        }
         rDyDxValues.ReSet();
         rDyDxValues.Add(0.0);
         rDyDxValues.Append(dY);
-        for (ULONG i=1; i<rDyDxValues.GetSize(); i++) {
+        for (ULONG i = 1; i < rDyDxValues.GetSize(); i++)
+        {
             rDyDxValues[i] = rDyDxValues[i] * sPV[1].x * -1.0;
         }
     }
@@ -6026,163 +6383,862 @@ SmStatus SmFace::ComputePreciseProperties
         dEstimatedArea,dFaceThickness,rdDeltaArea,rdDeltaVolume,rDeltaMoments,SM_PPF_ALL);
 }
 
-/*******************************************************************//**
-PURPOSE: Compute selected groups of precise face properties in one integration.
+/*******************************************************************/ /**
+ PURPOSE: Refine private property-integration trims independently of model tolerance.
 
-NOTES: Groups are independent. Both nested integrations retain the historical
-  area-derived error control, accuracy scales, and retry policy. Unrequested
-  properties are not integrated and their outputs are zero on success. Moments
-  retain the eight-vector layout documented above; second-moment groups include
-  the products and axial inertia vectors. Existing callers request ALL.
-***********************************************************************/
-SmStatus SmFace::ComputePreciseProperties
-(
-  SmOrientType           eOrientation,           // in :
-  double                 dDesiredAccuracy,       // in :
-  const SmPoint3d      & crOriginOfComputation,  // in :
-  double                 dEstimatedArea,         // in :
-  double                 dFaceThickness,         // in :
-  double               & rdDeltaArea,            // out:
-  double               & rdDeltaVolume,          // out:
-  SmTArray<SmVector3d> & rDeltaMoments,          // out:
-  ULONG                  lPropertyFlags         // in : Nonempty SmPrecisePropertyFlags mask
+ NOTES: Edgeuse UV curves are optional derived data. Their construction tolerance
+   can be much larger than a requested property accuracy. Reproject the defining
+   edge curves on an unowned surface copy; never replace source trims or change
+   topology, edge/surface geometry, or model tolerances. Synthetic UV lines that
+   bridge surface singularities retain their existing parameter-space meaning.
+ ***********************************************************************/
+// Tight DropCurve fitting can fail on an otherwise valid model gap, or when
+// the closest point is constrained to a natural surface boundary. In that
+// case fit closest points, rather than asking the fit tolerance to absorb the
+// geometric gap. This helper owns no model data and never modifies its inputs.
+class SmPropertyTrimProjector
+{
+    const SmSurface& m_surface;
+    const SmCurve& m_curve;
+    const SmBSplineCurve& m_seed;
+    SmPropertyUVJet m_curveJet;
+    SmExtent2d m_domain;
+    double m_fitTolerance, m_gapTolerance;
+    ULONG m_budget = 1000000;
+    struct Sample
+    {
+        SmPoint3d uv, derivative, point;
+    };
+    SmTArray<SmPoint3d> m_poles;
+    SmTArray<double> m_knots;
+    SmTArray<ULONG> m_multiplicities;
+
+    static SmPoint3d Solve(double a, double b, double c, double x, double y, bool freezeU, bool freezeV)
+    {
+        const double floor = 64.0 * std::numeric_limits<double>::epsilon();
+        if (freezeU || a <= floor * c)
+        {
+            return SmPoint3d(0, !freezeV && c > 0 ? y / c : 0, 0);
+        }
+        if (freezeV || c <= floor * a)
+        {
+            return SmPoint3d(a > 0 ? x / a : 0, 0, 0);
+        }
+        const double det = a * c - b * b;
+        if (a <= 0 || c <= 0 || det <= floor * a * c)
+        {
+            return SmPoint3d(0, 0, 0);
+        }
+        return SmPoint3d((c * x - b * y) / det, (a * y - b * x) / det, 0);
+    }
+
+    SmStatus Project(double t, Sample& out)
+    {
+        if (!m_budget)
+        {
+            return SM_ERR;
+        }
+        --m_budget;
+        SER(m_curveJet.m_eStatus);
+        SmPoint3d curve[2], seed;
+        if (m_curveJet.m_bActive)
+        {
+            m_curveJet.Evaluate(t, curve);
+        }
+        else
+        {
+            SER(m_curve.Evaluate(t, 1, TRUE, curve, FALSE));
+        }
+        SER(m_seed.EvaluatePoint(t, seed));
+        SmPoint2d uv = m_domain.ClampPoint2d(SmPoint2d(seed.x, seed.y));
+        SmPoint3d jets[3][3];
+        double h00 = 0, h01 = 0, h11 = 0;
+        bool freezeU = false, freezeV = false, converged = false;
+        for (ULONG iteration = 0; iteration < 80; ++iteration)
+        {
+            SER(m_surface.EvaluateSimple(uv, 2, 2, TRUE, TRUE, TRUE, jets[0]));
+            const SmVector3d residual = curve[0] - jets[0][0];
+            const SmVector3d& du = jets[1][0];
+            const SmVector3d& dv = jets[0][1];
+            const double gu = du.Dot(residual), gv = dv.Dot(residual);
+            freezeU = (uv.x == m_domain.GetMin().x && gu <= 0) || (uv.x == m_domain.GetMax().x && gu >= 0);
+            freezeV = (uv.y == m_domain.GetMin().y && gv <= 0) || (uv.y == m_domain.GetMax().y && gv >= 0);
+            h00 = du.Dot(du) - residual.Dot(jets[2][0]);
+            h01 = du.Dot(dv) - residual.Dot(jets[1][1]);
+            h11 = dv.Dot(dv) - residual.Dot(jets[0][2]);
+            SmPoint3d step = Solve(h00, h01, h11, gu, gv, freezeU, freezeV);
+            if (gu * step.x + gv * step.y < 0 || (step.LengthSquared() == 0 && (!freezeU || !freezeV)))
+            {
+                step = Solve(du.Dot(du), du.Dot(dv), dv.Dot(dv), gu, gv, freezeU, freezeV);
+            }
+            const double roundoff = 32.0 * std::numeric_limits<double>::epsilon() * (1.0 + jets[0][0].Length() + curve[0].Length());
+            const double accuracy = smos_Max(m_fitTolerance / 16.0, roundoff);
+            // Test the constrained physical step: an outward gradient at an
+            // active boundary is a valid closest point, not nonconvergence.
+            const SmPoint2d next = m_domain.ClampPoint2d(SmPoint2d(uv.x + step.x, uv.y + step.y));
+            if ((du * (next.x - uv.x) + dv * (next.y - uv.y)).Length() <= accuracy)
+            {
+                converged = true;
+                break;
+            }
+            bool accepted = false;
+            for (ULONG trial = 0; trial < 24; ++trial)
+            {
+                const SmPoint2d candidate = m_domain.ClampPoint2d(SmPoint2d(uv.x + step.x, uv.y + step.y));
+                SmPoint3d point;
+                SER(m_surface.EvaluatePoint(candidate, point));
+                // Squared distances to a gapped surface cannot distinguish
+                // improvements below gap * point-evaluation roundoff.
+                const double objectiveRoundoff = 2.0 * residual.Length() * roundoff + roundoff * roundoff;
+                if ((curve[0] - point).LengthSquared() <= residual.LengthSquared() + objectiveRoundoff)
+                {
+                    uv = candidate;
+                    accepted = true;
+                    break;
+                }
+                step *= .5;
+            }
+            if (!accepted)
+            {
+                return SM_ERR;
+            }
+        }
+        if (!converged)
+        {
+            return SM_ERR;
+        }
+        const double roundoff = 64.0 * std::numeric_limits<double>::epsilon() * (1.0 + jets[0][0].Length() + curve[0].Length());
+        if ((curve[0] - jets[0][0]).Length() > m_gapTolerance + roundoff)
+        {
+            return SM_ERR;
+        }
+        out.uv = SmPoint3d(uv.x, uv.y, 0);
+        out.point = jets[0][0];
+        // Differentiate the closest-point equations, including their
+        // curvature term. J^T J alone gives the wrong tangent for model gaps.
+        const SmVector3d residual = curve[0] - jets[0][0];
+        const double gradientAccuracy = smos_Max(m_fitTolerance / 16.0, roundoff);
+        // At a curve endpoint, a zero outward gradient does not imply that
+        // the following curve tangent is constrained. Freeze only a strictly
+        // active closest-point constraint; otherwise retain the inward jet.
+        const bool activeU = freezeU && smos_Fabs(jets[1][0].Dot(residual)) > gradientAccuracy * jets[1][0].Length();
+        const bool activeV = freezeV && smos_Fabs(jets[0][1].Dot(residual)) > gradientAccuracy * jets[0][1].Length();
+        out.derivative = Solve(h00, h01, h11, jets[1][0].Dot(curve[1]), jets[0][1].Dot(curve[1]), activeU, activeV);
+        return SM_SUCCESS;
+    }
+
+    SmStatus Fit(double a, const Sample& first, double b, const Sample& last, ULONG depth)
+    {
+        if (m_knots.GetSize() > 8192)
+        {
+            return SM_ERR;
+        }
+        const double interval = b - a;
+        std::array<SmPoint3d, 4> poles = { first.uv,
+                                           first.uv + first.derivative * (interval / 3.0),
+                                           last.uv - last.derivative * (interval / 3.0),
+                                           last.uv };
+        // A Bezier span with all poles in a rectangle stays in that
+        // rectangle. Constrain the fitted curve itself, then check its fit;
+        // do not clamp evaluation points to disguise domain excursions.
+        for (auto& pole : poles)
+        {
+            const SmPoint2d uv = m_domain.ClampPoint2d(SmPoint2d(pole.x, pole.y));
+            pole = SmPoint3d(uv.x, uv.y, 0);
+        }
+        bool accurate = true;
+        Sample middle;
+        for (ULONG i = 1; i < 8; ++i)
+        {
+            const double s = double(i) / 8.0;
+            Sample exact;
+            SER(Project(a + interval * s, exact));
+            if (i == 4)
+            {
+                middle = exact;
+            }
+            const double r = 1.0 - s;
+            const SmPoint3d fit = poles[0] * (r * r * r) + poles[1] * (3 * r * r * s) + poles[2] * (3 * r * s * s) + poles[3] * (s * s * s);
+            SmPoint3d point;
+            const SmPoint2d uv = m_domain.ClampPoint2d(SmPoint2d(fit.x, fit.y));
+            SER(m_surface.EvaluatePoint(uv, point));
+            if ((point - exact.point).Length() > m_fitTolerance)
+            {
+                accurate = false;
+            }
+        }
+        if (!accurate)
+        {
+            const double mid = a + interval * .5;
+            if (depth == 24 || mid <= a || mid >= b)
+            {
+                return SM_ERR;
+            }
+            SER(Fit(a, first, mid, middle, depth + 1));
+            return Fit(mid, middle, b, last, depth + 1);
+        }
+        if (!m_poles.GetSize())
+        {
+            m_poles.Add(poles[0]);
+            m_knots.Add(a);
+            m_multiplicities.Add(4);
+        }
+        else
+        {
+            m_multiplicities[m_multiplicities.GetSize() - 1] = 3;
+        }
+        for (ULONG i = 1; i < 4; ++i)
+        {
+            m_poles.Add(poles[i]);
+        }
+        m_knots.Add(b);
+        m_multiplicities.Add(4);
+        return SM_SUCCESS;
+    }
+
+public:
+
+    SmPropertyTrimProjector(const SmSurface& surface, const SmCurve& curve, const SmBSplineCurve& seed, double fitTolerance, double gapTolerance)
+        : m_surface(surface),
+          m_curve(curve),
+          m_seed(seed),
+          m_curveJet(curve),
+          m_domain(surface.GetNaturalUVDomain()),
+          m_fitTolerance(fitTolerance),
+          m_gapTolerance(gapTolerance)
+    {
+    }
+
+    SmStatus Create(const SmContext& context, const SmExtent1d& interval, SmBSplineCurve*& output)
+    {
+        output = NULL;
+        SmTArray<double> knots;
+        SER(m_curve.GetKnots(knots, NULL, &interval));
+        std::vector<double> breaks = { interval.GetMin(), interval.GetMax() };
+        for (double t : knots)
+        {
+            if (t > interval.GetMin() && t < interval.GetMax())
+            {
+                breaks.push_back(t);
+            }
+        }
+        std::sort(breaks.begin(), breaks.end());
+        breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
+        for (size_t i = 0; i + 1 < breaks.size(); ++i)
+        {
+            Sample first, last;
+            SER(Project(breaks[i], first));
+            SER(Project(breaks[i + 1], last));
+            SER(Fit(breaks[i], first, breaks[i + 1], last, 0));
+        }
+        return SmBSplineCurve::CreateCanonical(
+            context,
+            2,
+            3,
+            m_poles,
+            SM_CF_UNSPECIFIED,
+            m_multiplicities,
+            m_knots,
+            SM_KT_PIECEWISE_BEZIER_KNOTS,
+            NULL,
+            NULL,
+            output
+        );
+    }
+};
+
+// A shared boundary can be represented more accurately by its two surface
+// trims than by an approximated intersection edge. Keep that representation
+// only after checking agreement of both independent lifts and the model gap.
+// A single trim's own lift cannot establish this: it is on its surface by
+// construction, even if it defines the wrong boundary there.
+static SmStatus sm_PropertyTrimLiftsAgree(
+    const SmFace& face,
+    const SmSurface& surface,
+    const SmCurve& curve,
+    const SmEdge& edge,
+    const SmBSplineCurve& trim,
+    double fitTolerance,
+    double gapTolerance,
+    const SmAxis2Placement* translation,
+    SmBoolean& agree
+)
+{
+    agree = FALSE;
+    SmTArray<SmEdgeuse*> uses;
+    SER(edge.GetEdgeuses(uses));
+    const SmEdgeuse* neighbor = NULL;
+    for (auto* use : uses)
+    {
+        if (use->GetFaceuse() && use->GetFaceuse()->GetFace() != &face)
+        {
+            if (neighbor && neighbor->GetFaceuse()->GetFace() != use->GetFaceuse()->GetFace())
+            {
+                return SM_SUCCESS; // More than two distinct incident surfaces.
+            }
+            neighbor = use;
+        }
+    }
+    if (!neighbor)
+    {
+        return SM_SUCCESS;
+    }
+    const SmBSplineCurve* otherTrim = neighbor->GetUVTrimCurve();
+    if (!otherTrim)
+    {
+        return SM_SUCCESS; // Do not generate/modify source caches.
+    }
+    const SmSurface* otherSurface = neighbor->GetFaceuse()->GetFace()->GetSurface();
+    std::unique_ptr<SmSurface> localSurface;
+    if (translation)
+    {
+        SmSurface* copy = NULL;
+        const SmStatus status = otherSurface->Copy(*face.GetContext(), copy);
+        localSurface.reset(copy);
+        SER(status);
+        NER(copy);
+        SER(copy->Transform(*translation));
+        otherSurface = copy;
+    }
+    const SmExtent1d interval = edge.GetInterval();
+    if (!trim.GetNaturalInterval().AreEqual(interval, SM_EFF_ZERO) || !otherTrim->GetNaturalInterval().AreEqual(interval, SM_EFF_ZERO))
+    {
+        return SM_SUCCESS;
+    }
+    std::vector<double> breaks = { interval.GetMin(), interval.GetMax() };
+    for (const SmCurve* candidate : { static_cast<const SmCurve*>(&trim), static_cast<const SmCurve*>(otherTrim), &curve })
+    {
+        SmTArray<double> knots;
+        SER(candidate->GetKnots(knots, NULL, &interval));
+        for (double t : knots)
+        {
+            if (t > interval.GetMin() && t < interval.GetMax())
+            {
+                breaks.push_back(t);
+            }
+        }
+    }
+    std::sort(breaks.begin(), breaks.end());
+    breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
+    for (size_t i = 0; i + 1 < breaks.size(); ++i)
+    {
+        for (ULONG j = 0; j <= 8; ++j)
+        {
+            const double t = breaks[i] + (breaks[i + 1] - breaks[i]) * (double(j) / 8.0);
+            SmPoint3d uv, otherUV, point, otherPoint, edgePoint;
+            SER(trim.EvaluatePoint(t, uv));
+            SER(otherTrim->EvaluatePoint(t, otherUV));
+            SER(surface.EvaluatePoint(SmPoint2d(uv.x, uv.y), point));
+            SER(otherSurface->EvaluatePoint(SmPoint2d(otherUV.x, otherUV.y), otherPoint));
+            SER(curve.EvaluatePoint(t, edgePoint));
+            if ((point - otherPoint).Length() > fitTolerance || (point - edgePoint).Length() > gapTolerance)
+            {
+                return SM_SUCCESS;
+            }
+        }
+    }
+    agree = TRUE;
+    return SM_SUCCESS;
+}
+
+static SmStatus sm_RefinePropertyTrimCurves(
+    const SmFace& crFace,
+    const SmExtent3d& crBounds,
+    double dApproxTolerance,
+    SmTArray<SmBSplineCurve*>& rBoundary
+)
+{
+    // A rectangular trim is already defined by exact parameter-space bounds.
+    if (crFace.GetRectangularTrim() == TRUE)
+    {
+        return SM_SUCCESS;
+    }
+    // Natural surface producers and later topology edits can leave this cache
+    // unset. Prove the rectangle from its iso-parameter boundaries before
+    // trying to project already exact boundary data again.
+    SmExtent2d sRectDomain;
+    SmBoolean bRectangular = FALSE, bNatural = FALSE;
+    SER(crFace.FindIfRectangularTrim(sRectDomain, bRectangular, bNatural));
+    if (bRectangular)
+    {
+        return SM_SUCCESS;
+    }
+
+    const SmContext& crContext = *crFace.GetContext();
+    SmSurface* pRawSurface = NULL;
+    const SmStatus eCopy = crFace.GetSurface()->Copy(crContext, pRawSurface);
+    std::unique_ptr<SmSurface> sSurface(pRawSurface);
+    SER(eCopy);
+    NER(pRawSurface);
+    const SmPoint3d sCenter = crBounds.GetMid();
+    const SmBoolean bCenter = sCenter.Length() * std::numeric_limits<double>::epsilon() > dApproxTolerance;
+    const SmAxis2Placement sTranslation(-sCenter, SmVector3d(1, 0, 0), SmVector3d(0, 1, 0));
+    if (bCenter)
+    {
+        SER(sSurface->Transform(sTranslation));
+    }
+
+    std::map<const SmBSplineCurve*, std::unique_ptr<SmBSplineCurve>> sRefined;
+    for (ULONG i = 0; i < rBoundary.GetSize(); ++i)
+    {
+        SmBSplineCurve* pBoundary = rBoundary[i];
+        SmEdgeuse* pUse = SM_CAST_PTR(SmEdgeuse, pBoundary->GetOwner());
+        // Singularity bridges have no edgeuse: they are UV-space connectors,
+        // not projected 3D edges, and must not be dropped onto the surface.
+        if (!pUse)
+        {
+            continue;
+        }
+        if (!pUse->GetFaceuse() || pUse->GetFaceuse()->GetFace() != &crFace)
+        {
+            return SM_ERR_INVALID_INPUT;
+        }
+        const SmBSplineCurve* pOriginal = pUse->GetUVTrimCurve();
+        NER(pOriginal);
+
+        auto& sAccurate = sRefined[pOriginal];
+        if (!sAccurate)
+        {
+            SmEdge* pEdge = pUse->GetEdge();
+            const SmCurve* pCurve = pEdge->GetCurve();
+            std::unique_ptr<SmCurve> sLocalCurve;
+            if (bCenter)
+            {
+                SmCurve* pCopy = NULL;
+                const SmStatus eCurveCopy = pCurve->Copy(crContext, pCopy);
+                sLocalCurve.reset(pCopy);
+                SER(eCurveCopy);
+                NER(pCopy);
+                SER(sLocalCurve->Transform(sTranslation));
+                pCurve = sLocalCurve.get();
+            }
+            const double dModelGap = smos_Max(double(pEdge->GetTolerance()), dApproxTolerance);
+            SmBoolean bCoherent = FALSE;
+            SER(sm_PropertyTrimLiftsAgree(
+                crFace,
+                *sSurface,
+                *pCurve,
+                *pEdge,
+                *pOriginal,
+                dApproxTolerance,
+                dModelGap,
+                bCenter ? &sTranslation : NULL,
+                bCoherent
+            ));
+            if (bCoherent)
+            {
+                // The private oriented boundary already follows the shared
+                // intersection more closely than the approximated 3D edge.
+                continue;
+            }
+            // Prefer a compact cubic fit at the requested spatial accuracy.
+            // DropCurve can over-refine to many tiny spans, multiplying the
+            // later nested quadrature cost. Both paths retain the same fit
+            // and model-gap requirements and preserve the cached seam branch.
+            SmPropertyTrimProjector sPreferred(*sSurface, *pCurve, *pOriginal, dApproxTolerance, dModelGap);
+            SmBSplineCurve* pPreferred = NULL;
+            const SmStatus ePreferred = sPreferred.Create(crContext, pEdge->GetInterval(), pPreferred);
+            std::unique_ptr<SmBSplineCurve> sPreferredCurve(pPreferred);
+            if (ePreferred == SM_SUCCESS && pPreferred)
+            {
+                sAccurate = std::move(sPreferredCurve);
+            }
+            else
+            {
+                SmTArray<SmBSplineCurve*> sCandidates;
+                SmObjsDelete<SmBSplineCurve*> sDeleteCandidates(&sCandidates);
+                double dSurfaceGap = 0.0, dApproxDeviation = 0.0;
+                // Face bounds were computed from the old approximate trims. Use
+                // the underlying surface domain so they cannot clip a tighter fit.
+                const SmStatus dropStatus = sSurface->DropCurve(
+                    crContext,
+                    sSurface->GetNaturalUVDomain(),
+                    *pCurve,
+                    pEdge->GetInterval(),
+                    SmApproxTol3d(dApproxTolerance),
+                    dSurfaceGap,
+                    dApproxDeviation,
+                    sCandidates,
+                    TRUE
+                );
+                double dBest = std::numeric_limits<double>::max();
+                SmBSplineCurve* pBest = NULL;
+                if (dropStatus == SM_SUCCESS && dSurfaceGap <= dModelGap && dApproxDeviation <= 16.0 * dApproxTolerance)
+                {
+                    for (auto* pCandidate : sCandidates)
+                    {
+                        // Preserve the cached seam branch; partial projected
+                        // segments are not interchangeable with full boundaries.
+                        if (!pCandidate->GetNaturalInterval().AreEqual(pEdge->GetInterval(), SM_EFF_ZERO))
+                        {
+                            continue;
+                        }
+                        double dDifference = 0.0;
+                        for (double t : { 0.0, .19, .47, .73, 1.0 })
+                        {
+                            SmPoint3d sOld, sNew;
+                            SER(pOriginal->EvaluatePoint(pOriginal->GetNaturalInterval().Evaluate(t), sOld));
+                            SER(pCandidate->EvaluatePoint(pCandidate->GetNaturalInterval().Evaluate(t), sNew));
+                            dDifference += (sOld - sNew).LengthSquared();
+                        }
+                        if (dDifference < dBest)
+                        {
+                            dBest = dDifference;
+                            pBest = pCandidate;
+                        }
+                    }
+                }
+                if (!pBest)
+                {
+                    return ePreferred == SM_SUCCESS ? SM_ERR : ePreferred;
+                }
+                SmBSplineCurve* pCopy = NULL;
+                const SmStatus eCandidateCopy = pBest->Copy(crContext, pCopy);
+                sAccurate.reset(pCopy);
+                SER(eCandidateCopy);
+                NER(pCopy);
+            }
+        }
+
+        // The stored edgeuse trim follows the 3D edge. Oriented integration
+        // boundaries can traverse it in either direction, including closed
+        // curves whose endpoints alone do not distinguish orientation.
+        double dForward = 0.0, dReverse = 0.0;
+        for (double t : { 0.0, .19, .47, .73, 1.0 })
+        {
+            SmPoint3d sBoundary, sForward, sReverse;
+            SER(pBoundary->EvaluatePoint(pBoundary->GetNaturalInterval().Evaluate(t), sBoundary));
+            SER(pOriginal->EvaluatePoint(pOriginal->GetNaturalInterval().Evaluate(t), sForward));
+            SER(pOriginal->EvaluatePoint(pOriginal->GetNaturalInterval().Evaluate(1.0 - t), sReverse));
+            dForward += (sBoundary - sForward).LengthSquared();
+            dReverse += (sBoundary - sReverse).LengthSquared();
+        }
+        SmBSplineCurve* pCopy = NULL;
+        const SmStatus eBoundaryCopy = sAccurate->Copy(crContext, pCopy);
+        std::unique_ptr<SmBSplineCurve> sReplacement(pCopy);
+        SER(eBoundaryCopy);
+        NER(pCopy);
+        SER(pCopy->ConvertTo2D());
+        if (dReverse < dForward)
+        {
+            SmExtent1d sInterval = pCopy->GetNaturalInterval();
+            SER(pCopy->ReverseParameterization(sInterval, sInterval));
+        }
+        pCopy->SetOwner(pBoundary->GetOwner());
+        delete pBoundary;
+        rBoundary[i] = sReplacement.release();
+    }
+    return SM_SUCCESS;
+}
+
+/*******************************************************************/ /**
+ PURPOSE: Compute selected groups of precise face properties in one accurate pass.
+
+ NOTES: Groups are independent. A coarse area or volume estimate calibrates the
+   dimensional scales; nested Gaussian quadrature checks fixed absolute error
+   estimates on smooth spans. The accurate pass uses private projected trims.
+   Unrequested output groups are zero on success. Moments
+   retain the eight-vector layout documented above; second-moment groups include
+   the products and axial inertia vectors. Existing callers request ALL.
+ ***********************************************************************/
+SmStatus SmFace::ComputePreciseProperties(
+    SmOrientType eOrientation, // in :
+    double dDesiredAccuracy, // in :
+    const SmPoint3d& crOriginOfComputation, // in :
+    double dEstimatedArea, // in :
+    double dFaceThickness, // in :
+    double& rdDeltaArea, // out:
+    double& rdDeltaVolume, // out:
+    SmTArray<SmVector3d>& rDeltaMoments, // out:
+    ULONG lPropertyFlags // in : Nonempty SmPrecisePropertyFlags mask
 ) const
 {
-    if (!lPropertyFlags || (lPropertyFlags & ~ULONG(SM_PPF_ALL))) return SM_ERR_INVALID_INPUT;
+    if (!lPropertyFlags || (lPropertyFlags & ~ULONG(SM_PPF_ALL)))
+    {
+        return SM_ERR_INVALID_INPUT;
+    }
 
     // accuracy should not be zero.
-    SM_ASSERT( dDesiredAccuracy >= SM_EFF_ZERO );
-    if ( dDesiredAccuracy < SM_EFF_ZERO ) {
+    SM_ASSERT(dDesiredAccuracy >= SM_EFF_ZERO);
+    if (dDesiredAccuracy < SM_EFF_ZERO)
+    {
         dDesiredAccuracy = SM_EFF_ZERO_SQ;
     }
 
-    double dTotalArea   = 0.0;
+    double dTotalArea = 0.0;
     double dTotalVolume = 0.0;
 
     rDeltaMoments.SetSize(8);
-    for (ULONG ii=0; ii<rDeltaMoments.GetSize(); ii++) {
-        rDeltaMoments[ii].Set(0,0,0);
+    for (ULONG ii = 0; ii < rDeltaMoments.GetSize(); ii++)
+    {
+        rDeltaMoments[ii].Set(0, 0, 0);
     }
 
     SmTArray<ULONG> sLoops;
     SmTArray<SmBSplineCurve*> sUVCurves2;
     SmObjsDelete<SmBSplineCurve*> sCleanup(&sUVCurves2);
-    SER(CreateOrientedTrimBoundary(*GetContext(),TRUE,TRUE,sLoops,sUVCurves2));
+    SER(CreateOrientedTrimBoundary(*GetContext(), TRUE, TRUE, sLoops, sUVCurves2));
 
     // Compute the surface area by integrating between the curves and
     // minimum U value of the surface.
 
     const SmPrecisePropertyLayout sLayout(lPropertyFlags);
     const ULONG lNumComponents = sLayout.m_lNumComponents;
-    SmTArray<double> yscale(lNumComponents,NULL,lNumComponents);
+    SmTArray<double> yscale(lNumComponents, NULL, lNumComponents);
     // Every requested property needs error control. An effectively infinite
     // scale for moments/volume lets the area converge while those quantities
     // remain inaccurate, even when the requested accuracy is tightened.
     SmExtent3d sPropertyBounds;
     SER(CalculateBoundingBox(sPropertyBounds));
+    const double dTrimApproxTolerance = smos_Max(SM_EFF_ZERO, dDesiredAccuracy * sPropertyBounds.GetSize().Length() / 100.0);
     const SmVector3d sLow = sPropertyBounds.GetMin() - crOriginOfComputation;
     const SmVector3d sHigh = sPropertyBounds.GetMax() - crOriginOfComputation;
-    const SmVector3d sRadius(smos_Max(smos_Fabs(sLow.x), smos_Fabs(sHigh.x)),
-                              smos_Max(smos_Fabs(sLow.y), smos_Fabs(sHigh.y)),
-                              smos_Max(smos_Fabs(sLow.z), smos_Fabs(sHigh.z)));
+    const SmVector3d sRadius(
+        smos_Max(smos_Fabs(sLow.x), smos_Fabs(sHigh.x)),
+        smos_Max(smos_Fabs(sLow.y), smos_Fabs(sHigh.y)),
+        smos_Max(smos_Fabs(sLow.z), smos_Fabs(sHigh.z))
+    );
     const double dLengthScale = smos_Max(sRadius.Length(), SM_EFF_ZERO);
-    const double dAreaScale = smos_Max(smos_Fabs(dEstimatedArea)/10.0, SM_EFF_ZERO_SQ);
+    double dAreaScale = smos_Max(smos_Fabs(dEstimatedArea) / 10.0, SM_EFF_ZERO_SQ);
     // Subtracting a distant origin after world-space evaluation introduces
     // roundoff noise into moment integrands. Center a private surface before
     // evaluation when that noise would exceed the requested local accuracy.
     // UV trims and the caller's geometry remain unchanged.
-    const SmSurface *pIntegrationSurface = GetSurface();
+    const SmSurface* pIntegrationSurface = GetSurface();
     SmPoint3d sIntegrationOrigin = crOriginOfComputation;
     std::unique_ptr<SmSurface> sCenteredSurface;
-    if (crOriginOfComputation.Length()*std::numeric_limits<double>::epsilon()
-          > dDesiredAccuracy*dLengthScale/100.0)
+    if (crOriginOfComputation.Length() * std::numeric_limits<double>::epsilon() > dDesiredAccuracy * dLengthScale / 100.0)
     {
-        SmSurface *pCopy = NULL;
+        SmSurface* pCopy = NULL;
         const SmStatus eCopyStatus = GetSurface()->Copy(*GetContext(), pCopy);
         sCenteredSurface.reset(pCopy);
         SER(eCopyStatus);
-        const SmAxis2Placement sPlacement(-crOriginOfComputation,
-                                           SmVector3d(1,0,0), SmVector3d(0,1,0));
+        const SmAxis2Placement sPlacement(-crOriginOfComputation, SmVector3d(1, 0, 0), SmVector3d(0, 1, 0));
         SER(sCenteredSurface->Transform(sPlacement));
         pIntegrationSurface = sCenteredSurface.get();
-        sIntegrationOrigin.Set(0,0,0);
+        sIntegrationOrigin.Set(0, 0, 0);
     }
-    for (ULONG iii=0; iii<yscale.GetSize(); iii++) { yscale[iii] = dAreaScale; }
-    if (sLayout.m_lVolume) yscale[sLayout.m_lVolume-1] = dAreaScale*dLengthScale;
-    for (ULONG iMoment=0; iMoment<8; ++iMoment)
+    // Calibrate the dimensional error scale from a coarse integral of the
+    // original boundary. A fixed fraction of squared box extent can be orders
+    // of magnitude below the requested property's scale and drive nested
+    // quadrature below roundoff. This estimate is never returned as a result.
+    // Volume-only callers estimate volume; they do not compute unrequested area.
+    const SmBoolean bScaleFromArea = lPropertyFlags & (SM_PPF_AREA | SM_PPF_AREA_FIRST_MOMENTS | SM_PPF_AREA_SECOND_MOMENTS);
+    const SmPrecisePropertyLayout sScaleLayout(bScaleFromArea ? SM_PPF_AREA : SM_PPF_VOLUME);
+    SmTArray<double> sScaleBounds(sScaleLayout.m_lNumComponents, NULL, sScaleLayout.m_lNumComponents);
+    const double dBoxAreaScale = smos_Max(sPropertyBounds.GetSize().LengthSquared(), SM_EFF_ZERO_SQ);
+    sScaleBounds.SetAll(dBoxAreaScale);
+    if (!bScaleFromArea)
     {
-        if (!sLayout.m_aMoments[iMoment]) continue;
-        double dScale = dAreaScale*dLengthScale;
-        if (iMoment != 0) dScale *= dLengthScale;
-        if (iMoment >= 5) dScale *= dLengthScale;
-        const ULONG lStart = sLayout.m_aMoments[iMoment]-1;
-        for (ULONG iAxis=0; iAxis<3; ++iAxis) yscale[lStart+iAxis] = dScale;
+        sScaleBounds[sScaleLayout.m_lVolume - 1] = dBoxAreaScale * dLengthScale;
+    }
+    double dCoarseIntegral = 0.0;
+    SmBoolean bCoarseComplete = TRUE;
+    for (auto* pBoundary : sUVCurves2)
+    {
+        ULONG lCoarseBudget = 100000;
+        SmODEAreaIFEO sScaleEval(
+            *pIntegrationSurface,
+            *pBoundary,
+            GetUVDomain().GetMin().y,
+            1e-5,
+            &sScaleBounds,
+            sIntegrationOrigin,
+            dFaceThickness,
+            sScaleLayout,
+            lCoarseBudget,
+            FALSE
+        );
+        SmTArray<double> sCoarseValues;
+        const SmExtent1d sInterval = pBoundary->GetNaturalInterval();
+        const SmStatus
+            eCoarse = sm_PropertyGauss(sScaleEval, sInterval.GetMin(), sInterval.GetMax(), 1e-4, sScaleBounds, sCoarseValues, lCoarseBudget);
+        if (eCoarse != SM_SUCCESS)
+        {
+            // Calibration is only an optional estimate, with its own small
+            // budget. Discard partial estimates and retain the geometric
+            // floor; the accurate knot-split pass must still converge for
+            // every requested component. No partial value is returned.
+            bCoarseComplete = FALSE;
+            break;
+        }
+        dCoarseIntegral += sCoarseValues[(bScaleFromArea ? sScaleLayout.m_lArea : sScaleLayout.m_lVolume) - 1];
+    }
+    if (bCoarseComplete && dCoarseIntegral != 0.0)
+    {
+        // A face can have a zero volume contribution even in a nonzero solid.
+        // Do not turn roundoff in that coarse zero into an impossibly small
+        // error scale: retain the caller's dimensional geometric floor.
+        dAreaScale = smos_Max(dAreaScale, smos_Fabs(dCoarseIntegral) / (bScaleFromArea ? 10.0 : 10.0 * dLengthScale));
+    }
+    SER(sm_RefinePropertyTrimCurves(*this, sPropertyBounds, dTrimApproxTolerance, sUVCurves2));
+
+    for (ULONG iii = 0; iii < yscale.GetSize(); iii++)
+    {
+        yscale[iii] = dAreaScale;
+    }
+    if (sLayout.m_lVolume)
+    {
+        yscale[sLayout.m_lVolume - 1] = dAreaScale * dLengthScale;
+    }
+    for (ULONG iMoment = 0; iMoment < 8; ++iMoment)
+    {
+        if (!sLayout.m_aMoments[iMoment])
+        {
+            continue;
+        }
+        double dScale = dAreaScale * dLengthScale;
+        if (iMoment != 0)
+        {
+            dScale *= dLengthScale;
+        }
+        if (iMoment >= 5)
+        {
+            dScale *= dLengthScale;
+        }
+        const ULONG lStart = sLayout.m_aMoments[iMoment] - 1;
+        for (ULONG iAxis = 0; iAxis < 3; ++iAxis)
+        {
+            yscale[lStart + iAxis] = dScale;
+        }
     }
 
     double dSign = 1.0; // Note, if Thickness, don't return negative volumes.
-    if ( eOrientation == SM_OT_SAME && dFaceThickness < SM_EFF_ZERO ) {
+    if (eOrientation == SM_OT_SAME && dFaceThickness < SM_EFF_ZERO)
+    {
         dSign = -1.0;
     }
 
+    SmTArray<double> sSurfaceUKnots,sSurfaceVKnots;
+    SER(sm_PropertySurfaceKnots(*pIntegrationSurface,SM_SP_U,sSurfaceUKnots));
+    SER(sm_PropertySurfaceKnots(*pIntegrationSurface,SM_SP_V,sSurfaceVKnots));
     ULONG lEdgeIndex = 0;
-    for (ULONG i=0; i<sLoops.GetSize(); i++) {
-        for (ULONG k=0; k<sLoops[i]; k++) {
-            SmBSplineCurve *pBSC = sUVCurves2[lEdgeIndex++];
+    for (ULONG i = 0; i < sLoops.GetSize(); i++)
+    {
+        for (ULONG k = 0; k < sLoops[i]; k++)
+        {
+            SmBSplineCurve* pBSC = sUVCurves2[lEdgeIndex++];
 #ifdef SM_DEBUG_CODE
-SmBoolean bDebugMe = FALSE;
+            SmBoolean bDebugMe = FALSE;
             if (bDebugMe)
-              {
+            {
                 pBSC->Dump();
                 sm_GraphicsLoop();
-                pBSC->DrawWDeriv(pBSC->GetNaturalInterval(),0);
-                SmCrvOnSurf sTmp(*pBSC,*this->GetSurface());
-//              sTmp.SetContext(NULL);
+                pBSC->DrawWDeriv(pBSC->GetNaturalInterval(), 0);
+                SmCrvOnSurf sTmp(*pBSC, *this->GetSurface());
+                //              sTmp.SetContext(NULL);
                 sTmp.Draw();
                 sm_GraphicsLoop();
-              }
+            }
 #endif // SM_DEBUG_CODE
             yscale[0] = dAreaScale;
 
-            SmODEAreaIFEO sAreaEval(*pIntegrationSurface,*pBSC,GetUVDomain().GetMin().y,
-                dDesiredAccuracy/10.0,&yscale,sIntegrationOrigin,dFaceThickness,sLayout);
-            SmODEIntegrator sODE(sAreaEval);
-            SmTArray<double> dY(lNumComponents,NULL,lNumComponents);
+            // A bounded evaluation budget prevents failed nested quadrature
+            // from consuming an unbounded worker lifetime. Failure propagates.
+            ULONG lQuadratureBudget = 10000000;
+            SmODEAreaIFEO sAreaEval(
+                *pIntegrationSurface,
+                *pBSC,
+                GetUVDomain().GetMin().y,
+                dDesiredAccuracy / 10.0,
+                &yscale,
+                sIntegrationOrigin,
+                dFaceThickness,
+                sLayout,
+                lQuadratureBudget
+            );
+            SmTArray<double> dY(lNumComponents, NULL, lNumComponents);
             SmExtent1d sIvl = pBSC->GetNaturalInterval();
-            double dSpan = sIvl.GetMax() - sIvl.GetMin();
-            ULONG lNumOK, lNumBad;
-
-            // A coarse first Runge-Kutta step can trip the integrator's abort
-            // guard for one traversal direction, so a reversed cap loop fails
-            // where its twin succeeds. Try the historical span/2 step first
-            // (already-converged integrations stay unchanged), then fall back
-            // to finer steps; adaptive control converges to the same value.
-            static constexpr double kInitStepDivs[] = { 2.0, 8.0, 64.0, 512.0, 4096.0 };
-            SmStatus rkStat = SM_ERR;
-            for (ULONG iDiv = 0; iDiv < sizeof(kInitStepDivs)/sizeof(kInitStepDivs[0]); iDiv++)
+            // The projected trim is piecewise polynomial/rational. Crossing
+            // knot breaks in one adaptive step can hide spans or exhaust the
+            // recursion guard at tight tolerances. Integrate every span and
+            // divide the error budget; never relax the requested accuracy.
+            SmTArray<double> sKnots, sBreaks;
+            SER(pBSC->GetKnots(sKnots, NULL, &sIvl));
+            sBreaks.Add(sIvl.GetMin());
+            for (double dKnot : sKnots)
             {
-                // Zero the accumulator each try; a failed integrate leaves
-                // partial sums in dY that would double-count on the next retry.
-                dY.SetAll(0.0);
-                rkStat = sODE.RungeKuttaODEIntegrate(dY,sIvl.GetMin(), sIvl.GetMax(),
-                    dDesiredAccuracy/10.0, dSpan/kInitStepDivs[iDiv], 0.0, lNumOK, lNumBad,
-                    &yscale);
-                if (rkStat == SM_SUCCESS) { break; }
+                if (dKnot > sIvl.GetMin() && dKnot < sIvl.GetMax())
+                {
+                    sBreaks.Add(dKnot);
+                }
             }
-            // Propagate failure instead of dropping the boundary: a silent skip
-            // would return SM_SUCCESS with zero/partial properties, hiding a
-            // numerical failure as a valid zero.
-            SER(rkStat);
+            sBreaks.Add(sIvl.GetMax());
+            // A straight UV boundary also crosses surface knot lines. Those
+            // breaks need not coincide with its own (two) curve knots, e.g.
+            // the thirds of a 270-degree rational cylindrical surface.
+            if(pBSC->GetDegree()==1 && !pBSC->IsRational())
+            {
+                std::vector<double> breaks;
+                for(double t:sBreaks) breaks.push_back(t);
+                for(ULONG i=0;i+1<sBreaks.GetSize();++i)
+                {
+                    SmPoint3d first,last;
+                    SER(pBSC->EvaluatePoint(sBreaks[i],first));
+                    SER(pBSC->EvaluatePoint(sBreaks[i+1],last));
+                    for(ULONG axis=0;axis<2;++axis)
+                    {
+                        const auto &knots=axis==0 ? sSurfaceUKnots : sSurfaceVKnots;
+                        const double low=axis==0 ? first.x : first.y;
+                        const double high=axis==0 ? last.x : last.y;
+                        if(low==high) continue;
+                        for(double knot:knots)
+                        {
+                            const double fraction=(knot-low)/(high-low);
+                            if(fraction>0.0 && fraction<1.0)
+                                breaks.push_back(sBreaks[i]+fraction*(sBreaks[i+1]-sBreaks[i]));
+                        }
+                    }
+                }
+                std::sort(breaks.begin(),breaks.end());
+                breaks.erase(std::unique(breaks.begin(),breaks.end()),breaks.end());
+                sBreaks.ReSet();
+                for(double t:breaks) sBreaks.Add(t);
+            }
+            const ULONG lSpans = sBreaks.GetSize() - 1;
+            const double dParameterSpan = sIvl.GetMax() - sIvl.GetMin();
+            SmTArray<double> sBoundarySum(lNumComponents, NULL, lNumComponents);
+            sBoundarySum.SetAll(0.0);
+            for (ULONG iSpan = 0; iSpan < lSpans; ++iSpan)
+            {
+                const double dSpan = sBreaks[iSpan + 1] - sBreaks[iSpan];
+
+                SER(sm_PropertyGauss(
+                    sAreaEval,
+                    sBreaks[iSpan],
+                    sBreaks[iSpan + 1],
+                    dDesiredAccuracy * (dSpan / dParameterSpan) / 10.0,
+                    yscale,
+                    dY,
+                    lQuadratureBudget
+                ));
+                for (ULONG iComponent = 0; iComponent < lNumComponents; ++iComponent)
+                {
+                    sBoundarySum[iComponent] += dY[iComponent];
+                }
+            }
+            dY = sBoundarySum;
 
             // ODE evaluator indices are one-based; the result array is zero-based.
-            if (sLayout.m_lArea) dTotalArea += dY[sLayout.m_lArea-1];
-            if (sLayout.m_lVolume) dTotalVolume += dY[sLayout.m_lVolume-1] * dSign;
-            for (ULONG kk=0; kk<8; ++kk) {
-                if (!sLayout.m_aMoments[kk]) continue;
-                const ULONG lIndex = sLayout.m_aMoments[kk]-1;
+            if (sLayout.m_lArea)
+            {
+                dTotalArea += dY[sLayout.m_lArea - 1];
+            }
+            if (sLayout.m_lVolume)
+            {
+                dTotalVolume += dY[sLayout.m_lVolume - 1] * dSign;
+            }
+            for (ULONG kk = 0; kk < 8; ++kk)
+            {
+                if (!sLayout.m_aMoments[kk])
+                {
+                    continue;
+                }
+                const ULONG lIndex = sLayout.m_aMoments[kk] - 1;
                 const double dMomentSign = kk < 4 ? 1.0 : dSign;
                 rDeltaMoments[kk].x += dY[lIndex] * dMomentSign;
-                rDeltaMoments[kk].y += dY[lIndex+1] * dMomentSign;
-                rDeltaMoments[kk].z += dY[lIndex+2] * dMomentSign;
+                rDeltaMoments[kk].y += dY[lIndex + 1] * dMomentSign;
+                rDeltaMoments[kk].z += dY[lIndex + 2] * dMomentSign;
             }
         }
     }

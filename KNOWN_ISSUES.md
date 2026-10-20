@@ -52,7 +52,9 @@ On solids filleted with `circular_fillet`, `tessellate()` can wind some triangle
 
 ### Area, volume and mass properties of faces bounded by circles
 
-Face area, Brep area and volume, and mass properties (`Face.area()`, `Brep.area()`, `Brep.volume()` and the matching `SmApi*` functions) can be inaccurate for faces whose trim curves have interior knots, such as rational circles. Measured relative area errors were up to about 1.4% at the default `relative_accuracy` of 1e-3, and up to 20% at 1e-1.
+The original Runge–Kutta integrator produced inaccurate face/body properties for some trim curves with interior knots, including rational circles. Measured relative area errors were up to about 1.4% at the default `relative_accuracy` of 1e-3, and up to 20% at 1e-1.
+
+The cq-smlib fork now splits Gaussian property integration at trim/surface knots and refines private measurement trims. Analytic spherical caps and SDK cylinder/circular-face controls cover selected loose, default and tight requests. The cylinder control did not reproduce the original worst errors, so it does not establish that the entire circular-trim issue is resolved; broader accuracy remains unqualified. The earlier percentages describe the original integrator.
 
 **Workaround:** use a smaller `relative_accuracy`. The error fell as the accuracy was tightened in every measured case.
 
