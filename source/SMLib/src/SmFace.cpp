@@ -6473,6 +6473,15 @@ class SmPropertyTrimProjector
             }
             const double roundoff = 32.0 * std::numeric_limits<double>::epsilon() * (1.0 + jets[0][0].Length() + curve[0].Length());
             const double accuracy = smos_Max(m_fitTolerance / 16.0, roundoff);
+            // A rank-deficient normal matrix can return a zero step even
+            // with a nonzero free gradient. That is not convergence. Let
+            // the SDK projection try instead of accepting the cached seed.
+            if (step.LengthSquared() == 0.0 &&
+                ((!freezeU && smos_Fabs(gu) > 8.0 * accuracy * du.Length()) ||
+                 (!freezeV && smos_Fabs(gv) > 8.0 * accuracy * dv.Length())))
+            {
+                return SM_ERR;
+            }
             // Test the constrained physical step: an outward gradient at an
             // active boundary is a valid closest point, not nonconvergence.
             const SmPoint2d next = m_domain.ClampPoint2d(SmPoint2d(uv.x + step.x, uv.y + step.y));
