@@ -481,6 +481,35 @@ METHOD --- 1. Rotate Point around rotation axis    - use rotation angle in degre
            2. Intersect RotatedPoint with GenCurve - use GenCurve STEP Param as V parameter.
            3. Set Location value for points on poles, seams, and interiors
 ***********************************************************************/
+// The planar fast solver rotates a target into the positive radial half-plane.
+// A circular meridian can also occupy the opposite half-plane (for example a
+// spindle torus). In that case the same target needs a second angular branch;
+// use the general surface solver rather than returning a wrong closest point.
+static SmBoolean sm_RevolutionGeneratorHasNegativeRadius
+  (const SmSurfOfRevolution & crSurface)
+{
+  const SmBSplineCurve *pGenerator = crSurface.GetGenCurve();
+  if(!pGenerator || pGenerator->GetType() != SmCircle_TYPE) { return FALSE; }
+  SmAxis2Placement sCircle;
+  double dRadius = 0.0;
+  if(static_cast<const SmCircle *>(pGenerator)->GetCanonical(sCircle,dRadius) != SM_SUCCESS)
+    { return TRUE; }
+  const SmVector3d &rRadial = crSurface.GetPosition().GetXAxisRef();
+  const double dCenter = (sCircle.GetOrigin() - crSurface.GetOrigin()).Dot(rRadial);
+  const double dCos = dRadius * sCircle.GetXAxisRef().Dot(rRadial);
+  const double dSin = dRadius * sCircle.GetYAxisRef().Dot(rRadial);
+  const SmExtent1d sDomain = pGenerator->GetSTEPInterval();
+  const double dFirst = sDomain.GetMin() * SM_PI / 180.0;
+  const double dLast = sDomain.GetMax() * SM_PI / 180.0;
+  double dMin = smos_Min(dCenter + dCos*cos(dFirst) + dSin*sin(dFirst),
+                        dCenter + dCos*cos(dLast) + dSin*sin(dLast));
+  const double dPhase = atan2(dSin,dCos) + SM_PI;
+  const double dStation = dPhase + 2.0*SM_PI*ceil((dFirst-dPhase)/(2.0*SM_PI));
+  if(dStation <= dLast)
+    { dMin = smos_Min(dMin,dCenter - sqrt(dCos*dCos+dSin*dSin)); }
+  return dMin < -SM_EFF_ZERO ? TRUE : FALSE;
+}
+
 SmStatus SmSurfOfRevolution::STEPInversion
   (const SmExtent2d & crAnalDomain,       // in : domain limit for valid transformations
                                           //      Passed on to SmBSplineSurface::STEPINVERSION for nonPlanar GenCurves
@@ -499,10 +528,10 @@ SmStatus SmSurfOfRevolution::STEPInversion
    SmPoint2d        * pUVGuess)           // in, opt: guess parameter.
   const
 {
-  // pass call along for nonPlanar generator curves
-  if ( !m_bPlanarGenerator )
+  // Use the general solver for nonPlanar or negative-radius meridians.
+  if ( !m_bPlanarGenerator || sm_RevolutionGeneratorHasNegativeRadius(*this) )
     {
-      // Not planar, must use the general solver.
+      // The positive-half-plane reduction is not sufficient for these cases.
 
       // Have to convert the analytical domain to a NURBS domain.
       SmExtent2d sNurbsDomain;
@@ -514,9 +543,11 @@ SmStatus SmSurfOfRevolution::STEPInversion
       ConvertUVFromSTEPToNURBS( sStepUV, sNurbsUV );
       sNurbsDomain.AddPoint2d( sNurbsUV );
 
-      SmPoint2d sNurbsParameter;
+      SmPoint2d sNurbsParameter, sNurbsGuess;
+      if(pUVGuess) { SER(ConvertUVFromSTEPToNURBS(*pUVGuess,sNurbsGuess)); }
       SER(SmBSplineSurface::STEPInversion( sNurbsDomain, crPointOnSurf, d3DTolerance,
-                                           sNurbsParameter, reLocation, pUVGuess ));
+                                           sNurbsParameter, reLocation,
+                                           pUVGuess ? &sNurbsGuess : NULL ));
       SER(ConvertUVFromNURBSToSTEP(sNurbsParameter, rdAnalUVParameter));
       return SM_SUCCESS;
     }
@@ -2371,6 +2402,7 @@ SmStatus SmSurfOfRevolution::DropPointFast              // eff: proj point to St
   // no work - can't convert to polar coordinates - does not have a planar generator
   if (!HavePolarConversion()) { return SM_ERR; }
   if (!m_bPlanarGenerator)    { return SM_ERR; }
+  if (sm_RevolutionGeneratorHasNegativeRadius(*this)) { return SM_ERR; }
 
   // init output
   rSolutions.ReSet();
