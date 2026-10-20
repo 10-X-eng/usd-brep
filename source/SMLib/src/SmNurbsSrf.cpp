@@ -14,6 +14,7 @@
 #include <SmBrep.h>
 #include <nurbs.h>
 #include <SmGeomUtility.h>
+#include <limits>
 
 
 static SM_THREAD_LOCAL TCHAR *rname = NULL;
@@ -1926,8 +1927,11 @@ SmBoolean sm_IsNSrfDegenerate
                   sNLBox.xr, sNLBox.yt, sNLBox.zf) ;
   SM_ASSERT(!sBox.HasNegativeVolume()) ;
  
-  // select a tolerance - scale it to the 1st control point location
-  double dScaledZero = 1000.0 * SM_EFF_ZERO * (1.0 + sBox.GetMaxDimension());
+  // Match the geometric surface predicate's floating-point placement floor.
+  // A fixed geometric tolerance scaled by world coordinates can otherwise
+  // classify a small translated control net as a single point.
+  double dScaledZero = 16.0 * std::numeric_limits<double>::epsilon()
+      * (1.0 + sBox.GetMaxDimension());
   double dTol        = smos_Max(d3DTol, dScaledZero);
 
  // test the bbox for point sized

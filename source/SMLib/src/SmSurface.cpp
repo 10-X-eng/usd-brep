@@ -61,6 +61,7 @@
 #include <SmSurfaceDropCurve.h>
 #include <SmSurfaceSilhouette.h>
 #include <nurbs.h>
+#include <limits>
 
 
 // GWC: Not yet ready to use  SM_TOLERANT_XSECT code
@@ -22549,7 +22550,7 @@ NOTES: A surface is deemed degenerate to a point when
 ***********************************************************************/
 SmBoolean SmSurface::IsDegeneratePoint
   (double             d3DTolerance, // in : min distance between unique points,
-                                    //      0.0 = use dScaledZero = 1000 * SM_EFF_ZERO*(1+GetMaxDimension(PtOnSurface))
+                                    //      0.0 = use a floating-point resolution floor scaled to surface placement
                                     //      default:[SM_ZONE_TOL_3D/10.0=1.0e-6]
    const SmExtent2d * pOptUVDomain) // in : domain to examine, NULL = use Natural Interval
                                     //      default:[NULL]
@@ -22586,8 +22587,11 @@ SmBoolean bDebugMe = FALSE ;
   Evaluate(sUV2,1,1,TRUE,TRUE,TRUE,sPV2[0],FALSE) ;  // exact Tangent values
   Evaluate(sUV3,1,1,TRUE,TRUE,TRUE,sPV3[0],FALSE) ;  // exact Tangent values
 
-  // select a tolerance - scale it to sP1 location
-  double dScaledZero = 1000.0 * SM_EFF_ZERO * (1.0 + sPV0[0][0].GetMaxDimension() + sPV1[0][0].GetMaxDimension());
+  // Only floating-point resolution grows with world placement. Multiplying
+  // the geometric zero tolerance by coordinates can collapse a small, fully
+  // representable surface merely because it is far from the origin.
+  double dScaledZero = 16.0 * std::numeric_limits<double>::epsilon()
+      * (1.0 + sPV0[0][0].GetMaxDimension() + sPV1[0][0].GetMaxDimension());
   double dTol2       = smos_Max(d3DTolerance * d3DTolerance,
                                 dScaledZero  * dScaledZero);
 
@@ -35208,7 +35212,9 @@ SmBoolean SmSurface::AssertValid
   bRtn &= SM_ASSERT_VALUE_REPORT(1, SM_LEVEL_0, sm_AssertTestSurface1(this, &sOutTol3d, &dOutVal), sOutTol3d, dOutVal, _T("")) ;
 
   /*  2 */ // Surface should not degenerate into a point
-  bRtn &= SM_ASSERT_VALUE_REPORT(2, SM_LEVEL_0, (!IsDegeneratePoint(SM_EFF_ZERO_DEG)), SM_EFF_ZERO_DEG, SM_UNDEF_DOUBLE, _T("")) ;
+  // Point collapse is a distance predicate; the angular tolerance used by
+  // the neighboring tangent tests would reject nondegenerate small faces.
+  bRtn &= SM_ASSERT_VALUE_REPORT(2, SM_LEVEL_0, (!IsDegeneratePoint(SM_EFF_ZERO)), SM_EFF_ZERO, SM_UNDEF_DOUBLE, _T("")) ;
 
   /*  3 */ // Surface should not degenerate into a curve
   bRtn &= SM_ASSERT_VALUE_REPORT(3, SM_LEVEL_0, (!IsDegenerateCurve(SM_EFF_ZERO_DEG)), SM_EFF_ZERO_DEG, SM_UNDEF_DOUBLE, _T("")) ;

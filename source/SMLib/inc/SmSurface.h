@@ -1474,7 +1474,7 @@ public:
                                            const ;
 
   virtual SmBoolean IsDegeneratePoint      (double             dTol3d = SM_ZONE_TOL_3D/10.0,    // in : min distance between unique points,                                        
-                                                                                                //    : 0.0 = use dScaledZero = 1000 * SM_EFF_ZERO*(1+GetMaxDimension(PtOnSurface))
+                                                                                                //    : 0.0 = use a floating-point resolution floor scaled to surface placement
                                                                                                 //    : default:[SM_ZONE_TOL_3D/10.0=1.0e-6]                                       
                                             const SmExtent2d * pOptUVDomain = NULL)             // in : domain to examine, NULL = use Natural Interval                             
                                            const ;
