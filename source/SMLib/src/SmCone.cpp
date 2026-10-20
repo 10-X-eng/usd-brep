@@ -2373,6 +2373,7 @@ SmStatus SmCone::GlobalSurfaceIntersect
                 pOpt3DCurves, pOptSurface1UVCurves, pOptSurface2UVCurves, pOptCurveTypes, pOptDeviations));
           break;
 
+      case SmCylinder_TYPE:
       case SmCone_TYPE:
           SER(IntersectWithCone(crContext,crUVDomain,(SmCone&)crOtherSurface,
               crOtherUVDomain, bUseSurfaceEdges, pdOptApproxTol3d,
@@ -2930,6 +2931,22 @@ SmBoolean bDebugMe = FALSE;
 
       
       // cylinders are parallel and nonCoincident
+      // The requested face domains can cover only an axial subinterval of
+      // either original cylinder. Clip the line before testing its start UV;
+      // the original cylinder bottom can be outside both requested domains.
+      SmExtent2d sStepDomain, sOtherStepDomain;
+      SER(ConvertDomainFromNURBSToSTEP(crUVDomain, sStepDomain));
+      SER(crOtherCone.ConvertDomainFromNURBSToSTEP(crOtherUVDomain, sOtherStepDomain));
+      double dThisMin = sStepDomain.GetVMin() - m_vAnalUVDomain.GetVMin();
+      double dThisMax = sStepDomain.GetVMax() - m_vAnalUVDomain.GetVMin();
+      double dAxisDot = sConeAxis.Dot(sOConeAxis);
+      double dOtherMin = dParam + (sOtherStepDomain.GetVMin() - crOtherCone.m_vAnalUVDomain.GetVMin()) * dAxisDot;
+      double dOtherMax = dParam + (sOtherStepDomain.GetVMax() - crOtherCone.m_vAnalUVDomain.GetVMin()) * dAxisDot;
+      dMin = smos_Max(dMin, smos_Max(dThisMin, smos_Min(dOtherMin, dOtherMax)));
+      dMax = smos_Min(dMax, smos_Min(dThisMax, smos_Max(dOtherMin, dOtherMax)));
+      if (dMin > dMax + dTol) { return SM_SUCCESS; }
+      if (dMin > dMax) { dMax = dMin; }
+
       ULONG lNumIntersections;
       SmPoint3d sIntersectPoints[6];
       SmPoint3d sStart = sCenterBot + dParam * sConeAxis;
