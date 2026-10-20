@@ -3982,6 +3982,7 @@ SmStatus SmEllipse::Transform
                                            //      other geom types only support isoptropic scaling
 {
   SmVector3d sIdentityScale(1, 1, 1);
+  const SmExtent1d sOriginalAnalDomain = m_vAnalDomain;
 
   // no work - identity transform
   if (crRotateNMove.IsIdentity() && (cpOptScale == NULL || *cpOptScale == sIdentityScale))
@@ -4029,6 +4030,13 @@ SmStatus SmEllipse::Transform
     {
       SER(SmBSplineCurve::Transform(crRotateNMove,cpOptScale));
     }
+
+  // A placement/scale does not change the angular parameter interval. The
+  // NURBS post-edit notification rebuilds the polar cache and can widen that
+  // interval from rounded world-coordinate endpoints after a distant move.
+  // Keep the defining analytic interval instead of propagating that roundoff
+  // into an owning surface's parameterization.
+  m_vAnalDomain = sOriginalAnalDomain;
 
   // all done
   return SM_SUCCESS;

@@ -2074,27 +2074,26 @@ SmStatus SmLine::Transform
       return SM_SUCCESS;
   }
 
-  // Get Anal StartPoint and Line(1.0) point.
-  // Eval at 1.0 because that will be used to calculate m_dScale,
-  // which is the speed, or distance per unit parameter.
+  // Transform the derivative as a vector. Subtracting two transformed points
+  // loses the line speed when a short line is moved far from the origin.
+  // That also breaks the unit generator required by cylinders and cones.
   SmPoint3d sStartPoint = m_vLinePoint;
-  SmPoint3d sEndPoint;
-  EvaluateSTEPPoint( 1.0, sEndPoint );
+  SmVector3d sDerivative = m_vLineVector * m_dScale;
 
   // scale the points
   if (cpOptScale) 
     {
       sStartPoint = sStartPoint.Multiply(*cpOptScale);
-      sEndPoint   = sEndPoint.Multiply(*cpOptScale);
+      sDerivative = sDerivative.Multiply(*cpOptScale);
     }    
 
   // rotate and move the points
   crRotateNMove.TransformPoint(sStartPoint, sStartPoint);
-  crRotateNMove.TransformPoint(sEndPoint, sEndPoint);
+  crRotateNMove.TransformVector(sDerivative, sDerivative);
 
   // reset the analytic parameters
   m_vLinePoint  = sStartPoint;
-  m_vLineVector = sEndPoint - sStartPoint;
+  m_vLineVector = sDerivative;
   m_dScale      = m_vLineVector.Length();
   m_vLineVector.Unitize();    
 

@@ -5708,7 +5708,8 @@ static SmStatus sm_PropertyGaussEstimate(
     SmTArray<double>& rIntegral,
     SmTArray<double>& rErrors,
     ULONG& rBudget,
-    ULONG lDepth = 0
+    ULONG lDepth = 0,
+    ULONG lMaximumDepth = 12
 )
 {
     const SmPropertyGaussPoint* aRules[] = { sPropertyGauss4, sPropertyGauss8, sPropertyGauss16, sPropertyGauss32 };
@@ -5735,13 +5736,13 @@ static SmStatus sm_PropertyGaussEstimate(
         sCoarse = rIntegral;
     }
     const double dMid = a / 2.0 + b / 2.0;
-    if (lDepth >= 12 || dMid == a || dMid == b)
+    if (lDepth >= lMaximumDepth || dMid == a || dMid == b)
     {
         return SM_SUCCESS; // Estimates checked by caller.
     }
     SmTArray<double> sLeft, sRight, sLeftErrors, sRightErrors;
-    SER(sm_PropertyGaussEstimate(crFunction, a, dMid, dAccuracy / 2.0, crScales, sLeft, sLeftErrors, rBudget, lDepth + 1));
-    SER(sm_PropertyGaussEstimate(crFunction, dMid, b, dAccuracy / 2.0, crScales, sRight, sRightErrors, rBudget, lDepth + 1));
+    SER(sm_PropertyGaussEstimate(crFunction, a, dMid, dAccuracy / 2.0, crScales, sLeft, sLeftErrors, rBudget, lDepth + 1, lMaximumDepth));
+    SER(sm_PropertyGaussEstimate(crFunction, dMid, b, dAccuracy / 2.0, crScales, sRight, sRightErrors, rBudget, lDepth + 1, lMaximumDepth));
     for (ULONG j = 0; j < crScales.GetSize(); ++j)
     {
         rIntegral[j] = sLeft[j] + sRight[j];
@@ -5761,15 +5762,29 @@ static SmStatus sm_PropertyGauss(
 )
 {
     SmTArray<double> sErrors;
-    SER(sm_PropertyGaussEstimate(crFunction, a, b, dAccuracy, crScales, rIntegral, sErrors, rBudget));
-    for (ULONG j = 0; j < crScales.GetSize(); ++j)
+    // Preserve converged estimates: blindly subdividing farther below a
+    // proportional local quota can amplify roundoff even when the sum meets
+    // the requested accuracy. Retry only a failed global error estimate.
+    // Near a vanishing Jacobian its magnitude can have a narrow corner that
+    // needs more than twelve bisections. Both attempts share the evaluation
+    // budget and must pass the same final error check for every component.
+    for (ULONG lMaximumDepth : {12UL, 24UL})
     {
-        if (sErrors[j] > dAccuracy * crScales[j])
+        SER(sm_PropertyGaussEstimate(crFunction, a, b, dAccuracy, crScales, rIntegral, sErrors, rBudget, 0, lMaximumDepth));
+        SmBoolean bConverged = TRUE;
+        for (ULONG j = 0; j < crScales.GetSize(); ++j)
         {
-            return SM_ERR;
+            if (sErrors[j] > dAccuracy * crScales[j])
+            {
+                bConverged = FALSE;
+            }
+        }
+        if (bConverged)
+        {
+            return SM_SUCCESS;
         }
     }
-    return SM_SUCCESS;
+    return SM_ERR;
 }
 
 /*******************************************************************/ /**

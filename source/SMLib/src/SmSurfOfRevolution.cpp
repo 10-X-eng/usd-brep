@@ -5376,7 +5376,7 @@ SmStatus SmSurfOfRevolution::Transform
   m_vPosition  = sTmpA2P;
 
   // transform the GenCurve
-  m_pGenCurve->Transform(crRotateNMove, cpOptScale) ;
+  SER(m_pGenCurve->Transform(crRotateNMove, cpOptScale));
 
   // apply transformation to underlying Nurb
   if (m_pNurb)
@@ -5384,8 +5384,17 @@ SmStatus SmSurfOfRevolution::Transform
       SER(SmBSplineSurface::Transform(crRotateNMove,cpOptScale));
     }
 
-  // update PolarConverter
-  RebuildPolarConverter() ;
+  // Rigid placement and positive uniform scale preserve the angular/NURBS
+  // correspondence. Transform the private cached iso-curve with the surface;
+  // reconstructing it from far-translated control points perturbs its analytic
+  // interval and violates the unchanged surface parameterization.
+  // Surface constructors and cache copies own this curve (not a borrowed
+  // ellipse self-cache).
+  SmEllipse *pPolarCurve = const_cast<SmEllipse *>(m_vPolarConverter.GetCurve());
+  if(m_vPolarConverter.IsPolarConversionPossible() && pPolarCurve)
+    { SER(pPolarCurve->Transform(crRotateNMove, cpOptScale)); }
+  else
+    { SER(RebuildPolarConverter()); }
 
   //      SmBSplineCurve *pRotationIsoCrv = NULL ;
   //      SmPoint2d       sMidUV          = m_vAnalUVDomain.Evaluate(.5678, .5678) ;
