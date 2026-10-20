@@ -5774,10 +5774,16 @@ SmBoolean bDebugMe = FALSE;
         //    rdResult = smos_Sqrt(dE * dG - dF * dF);
         SmVector3d sNorm = sPV[1][0] * sPV[0][1];
 
-        double dAreaDelta = sNorm.Length();
+        const SmBoolean bNeedArea = m_crLayout.m_lArea || m_crLayout.m_aMoments[0]
+                                                    || m_crLayout.m_aMoments[1];
+        // Volume integrands use the oriented Jacobian directly. Requiring
+        // an unrelated surface-area integral to converge can dominate a
+        // volume-only query, particularly on twisted swept surfaces.
+        double dAreaDelta = (bNeedArea || m_dFaceThickness > SM_EFF_ZERO)
+                          ? sNorm.Length() : 0.0;
         SmPoint3d sIPnt = sPV[0][0];  // Point to integrate
         rDyDxValues[1] = 0.0;
-        if (sPV[1][0].Length() > 0) {
+        if (bNeedArea && sPV[1][0].Length() > 0) {
             rDyDxValues[1] += dAreaDelta;  // This is the integration function used
         }
         // to control tolerances
@@ -5823,10 +5829,12 @@ SmBoolean bDebugMe = FALSE;
             // Do volumetric property
             double dDistToPlane = sPV[0][0].z;
             SmVector3d sUnitNorm = sNorm;
-            if (sUnitNorm.LengthSquared() > SM_EFF_ZERO_SQ) {
+            if (bNeedArea && sUnitNorm.LengthSquared() > SM_EFF_ZERO_SQ) {
                 SER(sUnitNorm.Unitize());
             }
-            double dVolumeDelta = dAreaDelta * dDistToPlane * sUnitNorm.z;
+            double dVolumeDelta = bNeedArea
+                                ? dAreaDelta * dDistToPlane * sUnitNorm.z
+                                : dDistToPlane * sNorm.z;
             if (m_crLayout.m_lVolume) rDyDxValues[m_crLayout.m_lVolume] = dVolumeDelta;
 
             // Compute volume static moments

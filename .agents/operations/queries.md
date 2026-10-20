@@ -412,6 +412,20 @@ failure reporting are retained; this is not a tessellation approximation.
 `Face.centroid()` requests area and area first moments in the same pass.
 `mass_properties()` and `Brep.volume()` still use full-property integration.
 
+The cq-smlib fork also provides a native `SmBrep::ComputePreciseProperties`
+overload with a final `ULONG` request mask from `SmPrecisePropertyFlags` in
+`SmFace.h`. The original overload requests `SM_PPF_ALL`; its symbol and output
+layout are retained. The selective overload keeps eight moment slots, sets
+unrequested scalars/groups to zero, and preserves density weighting of mass
+moments. Empty or unknown masks return `SM_ERR_INVALID_INPUT`.
+
+The custom cq-smlib adapter uses `SM_PPF_VOLUME` for volume and adds
+`SM_PPF_VOLUME_FIRST_MOMENTS` for its mass/centroid helper. Volume-only requests
+control the requested volume/moment errors directly, without an unrelated
+surface-area convergence requirement. Area requests and full-property calls
+retain area control. The stable Python/SM_API methods documented above retain
+their existing full-property path.
+
 | Method | Flat alias | Purpose |
 |---|---|---|
 | `face.bounding_box(tight=False)` | `face_bounding_box(face, tight)` | Axis-aligned bounding box of the face. `tight=True` samples within the trim boundary (expensive). |

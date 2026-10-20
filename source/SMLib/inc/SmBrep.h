@@ -349,6 +349,19 @@ public:
                                                                                //    : [7] Ixx, Iyy, Izz - Mass moments of inertia about the axes: integral of (y^2+z^2, x^2+z^2, x^2+y^2) dm
                                                                                //    : ([4..7] density-weighted (dm); Face / Region layers return geometric dV integrals)
 
+  // Selective precise properties. The original overload requests SM_PPF_ALL.
+  // lPropertyFlags is a nonempty SmPrecisePropertyFlags mask from SmFace.h.
+  // Unrequested scalar outputs and moment groups are zero; the eight moment
+  // slots and density conventions are the same as the original overload.
+  SmStatus ComputePreciseProperties(double dRelativeAccuracy,
+                                    const SmPoint3d & crOriginOfComputation,
+                                    const SmMassPropertyBehavior & crBehavior,
+                                    double & rdArea,
+                                    double & rdVolume,
+                                    double & rdMass,
+                                    SmTArray<SmVector3d> & rMoments,
+                                    ULONG lPropertyFlags) const;
+
   // Convert 3D and UV curves corresponding to SmLine curve when appropriate.
   SmStatus ConvertCurvesToAnalytics(ULONG & rlNum3DCurvesConverted,   // out: 
                                     ULONG & rlNumUVCurvesConverted) ; // out: 

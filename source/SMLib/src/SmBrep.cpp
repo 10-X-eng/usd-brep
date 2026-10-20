@@ -1645,6 +1645,31 @@ SmStatus SmBrep::ComputePreciseProperties
                                              //      ([4..7] are density-weighted (dm) here; the Face / Region layers return geometric dV integrals)
 ) const                                         
 {
+    return ComputePreciseProperties(dRelativeAccuracy, crOriginOfComputation,
+                                    crBehavior, rdArea, rdVolume, rdMass,
+                                    rMoments, SM_PPF_ALL);
+}
+
+SmStatus SmBrep::ComputePreciseProperties
+(
+  double dRelativeAccuracy,
+  const SmPoint3d & crOriginOfComputation,
+  const SmMassPropertyBehavior & crBehavior,
+  double & rdArea,
+  double & rdVolume,
+  double & rdMass,
+  SmTArray<SmVector3d> & rMoments,
+  ULONG lPropertyFlags
+) const
+{
+    if (!lPropertyFlags || (lPropertyFlags & ~ULONG(SM_PPF_ALL))) return SM_ERR_INVALID_INPUT;
+    const auto bMomentSelected = [lPropertyFlags](ULONG iMoment) {
+        const ULONG lFlag = iMoment == 0 ? SM_PPF_AREA_FIRST_MOMENTS
+                          : iMoment < 4 ? SM_PPF_AREA_SECOND_MOMENTS
+                          : iMoment == 4 ? SM_PPF_VOLUME_FIRST_MOMENTS
+                                         : SM_PPF_VOLUME_SECOND_MOMENTS;
+        return (lPropertyFlags & lFlag) != 0;
+    };
     rdArea = 0.0;
     rdVolume = 0.0;
     rdMass = 0.0;
@@ -1731,13 +1756,16 @@ SmStatus SmBrep::ComputePreciseProperties
             if (bVolumeSeparating) {
                 SER(pFU->GetFace()->ComputePreciseProperties(pFU->GetOrientation(),
                     dRelativeAccuracy,crOriginOfComputation,dEstimatedArea,0.0,
-                    dDeltaArea,dDeltaVolume,sDeltaMoments));
+                    dDeltaArea,dDeltaVolume,sDeltaMoments,lPropertyFlags));
 
                 // Now figure out how to use this faceuses data in the total computation
-                rdVolume += dDeltaVolume;
-                rdArea += dDeltaArea;
-                rdMass += dDeltaVolume * sMassVector.x; // mass = Volume times density
+                if (lPropertyFlags & SM_PPF_VOLUME) {
+                    rdVolume += dDeltaVolume;
+                    rdMass += dDeltaVolume * sMassVector.x; // mass = Volume times density
+                }
+                if (lPropertyFlags & SM_PPF_AREA) rdArea += dDeltaArea;
                 for (ULONG kk=0; kk<rMoments.GetSize(); kk++) {
+                    if (!bMomentSelected(kk)) continue;
                     if (kk > 3) {
                         rMoments[kk] = rMoments[kk] + sDeltaMoments[kk] * sMassVector.x;
                     }
@@ -1752,11 +1780,14 @@ SmStatus SmBrep::ComputePreciseProperties
 
                 SER( pFace->ComputePreciseProperties(pFU->GetOrientation(),
                     dRelativeAccuracy,crOriginOfComputation,dEstimatedArea,dFaceThickness,
-                    dDeltaArea,dDeltaVolume,sDeltaMoments));
-                rdVolume += dDeltaVolume;
-                rdArea += dDeltaArea;
-                rdMass += dDeltaVolume * sMassVector.x; // mass = volume times density
+                    dDeltaArea,dDeltaVolume,sDeltaMoments,lPropertyFlags));
+                if (lPropertyFlags & SM_PPF_VOLUME) {
+                    rdVolume += dDeltaVolume;
+                    rdMass += dDeltaVolume * sMassVector.x; // mass = volume times density
+                }
+                if (lPropertyFlags & SM_PPF_AREA) rdArea += dDeltaArea;
                 for (ULONG kk=0; kk<8; kk++) {
+                    if (!bMomentSelected(kk)) continue;
                     if (kk > 3) {
                         rMoments[kk] = rMoments[kk] + sDeltaMoments[kk] * sMassVector.x;
                     }
@@ -1789,10 +1820,13 @@ SmStatus SmBrep::ComputePreciseProperties
         SER(pE->ComputePreciseProperties(dRelativeAccuracy,crOriginOfComputation,sMassVector.y,
             dEdgeLength,dDeltaArea,dDeltaVolume,sDeltaMoments));
         if (sMassVector.x < SM_EFF_ZERO) sMassVector.x = 1.0;
-        rdVolume += dDeltaVolume;
-        rdArea += dDeltaArea;
-        rdMass += dDeltaVolume * sMassVector.x; // mass = volume times density
+        if (lPropertyFlags & SM_PPF_VOLUME) {
+            rdVolume += dDeltaVolume;
+            rdMass += dDeltaVolume * sMassVector.x; // mass = volume times density
+        }
+        if (lPropertyFlags & SM_PPF_AREA) rdArea += dDeltaArea;
         for (ULONG kk=0; kk<8; kk++) {
+             if (!bMomentSelected(kk)) continue;
              if (kk > 3) {
                  rMoments[kk] = rMoments[kk] + sDeltaMoments[kk] * sMassVector.x;
              }
@@ -1815,27 +1849,37 @@ SmStatus SmBrep::ComputePreciseProperties
         if (sMassVector.x < SM_EFF_ZERO) sMassVector.x = 1.0;
         double dDeltaVolume = 4.0*SM_PI*smos_Pow(sMassVector.y,3) / 3.0;
         double dDeltaArea = 4.0*SM_PI*sMassVector.y*sMassVector.y;
-        rdVolume += dDeltaVolume;
-        rdArea += dDeltaArea;
-        rdMass += dDeltaVolume * sMassVector.x; // mass = volume times density
+        if (lPropertyFlags & SM_PPF_VOLUME) {
+            rdVolume += dDeltaVolume;
+            rdMass += dDeltaVolume * sMassVector.x; // mass = volume times density
+        }
+        if (lPropertyFlags & SM_PPF_AREA) rdArea += dDeltaArea;
         SmPoint3d sPnt = pV->GetPoint();
-        rMoments[0] = rMoments[0] + dDeltaArea * sPnt;
-        rMoments[1] = rMoments[1] + dDeltaArea * sPnt.Multiply(sPnt);
-        rMoments[2].x += dDeltaArea * sPnt.y * sPnt.z;
-        rMoments[2].y += dDeltaArea * sPnt.z * sPnt.x;
-        rMoments[2].z += dDeltaArea * sPnt.x * sPnt.y;
-        rMoments[3].x += dDeltaArea * (sPnt.y*sPnt.y + sPnt.z*sPnt.z);
-        rMoments[3].y += dDeltaArea * (sPnt.x*sPnt.x + sPnt.z*sPnt.z);
-        rMoments[3].z += dDeltaArea * (sPnt.x*sPnt.x + sPnt.y*sPnt.y);
+        if (lPropertyFlags & SM_PPF_AREA_FIRST_MOMENTS) {
+            rMoments[0] = rMoments[0] + dDeltaArea * sPnt;
+        }
+        if (lPropertyFlags & SM_PPF_AREA_SECOND_MOMENTS) {
+            rMoments[1] = rMoments[1] + dDeltaArea * sPnt.Multiply(sPnt);
+            rMoments[2].x += dDeltaArea * sPnt.y * sPnt.z;
+            rMoments[2].y += dDeltaArea * sPnt.z * sPnt.x;
+            rMoments[2].z += dDeltaArea * sPnt.x * sPnt.y;
+            rMoments[3].x += dDeltaArea * (sPnt.y*sPnt.y + sPnt.z*sPnt.z);
+            rMoments[3].y += dDeltaArea * (sPnt.x*sPnt.x + sPnt.z*sPnt.z);
+            rMoments[3].z += dDeltaArea * (sPnt.x*sPnt.x + sPnt.y*sPnt.y);
+        }
 
-        rMoments[4] = rMoments[4] + dDeltaVolume * sPnt * sMassVector.x;
-        rMoments[5] = rMoments[5] + dDeltaVolume * sMassVector.x * sPnt.Multiply(sPnt) ;
-        rMoments[6].x += dDeltaVolume * sMassVector.x * sPnt.y * sPnt.z;
-        rMoments[6].y += dDeltaVolume * sMassVector.x * sPnt.z * sPnt.x;
-        rMoments[6].z += dDeltaVolume * sMassVector.x * sPnt.x * sPnt.y;
-        rMoments[7].x += dDeltaVolume * sMassVector.x * (sPnt.y*sPnt.y + sPnt.z*sPnt.z);
-        rMoments[7].y += dDeltaVolume * sMassVector.x * (sPnt.x*sPnt.x + sPnt.z*sPnt.z);
-        rMoments[7].z += dDeltaVolume * sMassVector.x * (sPnt.x*sPnt.x + sPnt.y*sPnt.y);
+        if (lPropertyFlags & SM_PPF_VOLUME_FIRST_MOMENTS) {
+            rMoments[4] = rMoments[4] + dDeltaVolume * sPnt * sMassVector.x;
+        }
+        if (lPropertyFlags & SM_PPF_VOLUME_SECOND_MOMENTS) {
+            rMoments[5] = rMoments[5] + dDeltaVolume * sMassVector.x * sPnt.Multiply(sPnt) ;
+            rMoments[6].x += dDeltaVolume * sMassVector.x * sPnt.y * sPnt.z;
+            rMoments[6].y += dDeltaVolume * sMassVector.x * sPnt.z * sPnt.x;
+            rMoments[6].z += dDeltaVolume * sMassVector.x * sPnt.x * sPnt.y;
+            rMoments[7].x += dDeltaVolume * sMassVector.x * (sPnt.y*sPnt.y + sPnt.z*sPnt.z);
+            rMoments[7].y += dDeltaVolume * sMassVector.x * (sPnt.x*sPnt.x + sPnt.z*sPnt.z);
+            rMoments[7].z += dDeltaVolume * sMassVector.x * (sPnt.x*sPnt.x + sPnt.y*sPnt.y);
+        }
     }
 
     return SM_SUCCESS;
