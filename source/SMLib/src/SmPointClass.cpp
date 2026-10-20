@@ -446,8 +446,8 @@ double SmPointClassification::GetGap3d
                                        sSolutions)) ;
      
 
-      // when a distinct solution was not found
-      if (sSolutions.GetSize() != 1) 
+      // Periodic seam maps need not have a unique parameter; retry only if empty.
+      if (sSolutions.GetSize() == 0)
         {
           // find point/face->surface intersection point to 100 * face->Tolerance
           SE(pOptSurface->GlobalPointSolve(sUVDomain,
@@ -459,13 +459,17 @@ double SmPointClassification::GetGap3d
                                            sSolutions)) ;
 
           // still no solutions - return an error
-          if (sSolutions.GetSize() != 1) 
+          if (sSolutions.GetSize() == 0)
             {
               return SM_ERR;
             }
         }
       
-      SmPoint2d sUV(sSolutions[0].m_vStart[0],sSolutions[0].m_vStart[1]) ;
+      ULONG lBest = 0;
+      for(ULONG ii=1; ii<sSolutions.GetSize(); ++ii)
+        if(sSolutions[ii].m_vStart.m_dSolutionValue < sSolutions[lBest].m_vStart.m_dSolutionValue)
+          { lBest = ii; }
+      SmPoint2d sUV(sSolutions[lBest].m_vStart[0],sSolutions[lBest].m_vStart[1]) ;
       SmPoint3d sSurfPt3d ;
       SmPoint3d sSurfNorm ;
       pOptSurface->EvaluatePoint(sUV, sSurfPt3d) ;
@@ -740,8 +744,9 @@ SmStatus SmPointClassification::ComputePointParameters
                                      SM_SR_SINGLE, 
                                      sSolutions));
 
-      // when a distinct solution was not found
-      if (sSolutions.GetSize() != 1) 
+      // Periodic surfaces can return several seam mappings for SM_SR_SINGLE.
+      // Retry only if there is no mapping; select the closest one below.
+      if (sSolutions.GetSize() == 0)
         {
           // find point/face->surface intersection point to 100 * face->Tolerance
           SER(pObjSurface->GlobalPointSolve(sUVDomain,
@@ -753,15 +758,20 @@ SmStatus SmPointClassification::ComputePointParameters
                                          sSolutions));
 
           // still no solutions - return an error
-          if (sSolutions.GetSize() != 1) 
+          if (sSolutions.GetSize() == 0)
             {
               return SM_ERR;
             }
         }
       
-      // save param and deviation
-      m_dGap3d     = sSolutions[0].m_vStart.m_dSolutionValue;
-      m_vUVParam   = SmPoint2d(sSolutions[0].m_vStart[0],sSolutions[0].m_vStart[1]);
+      // Preserve the requested single-point behavior by choosing the smallest
+      // reported geometric gap, rather than rejecting equivalent seam maps.
+      ULONG lBest = 0;
+      for(ULONG ii=1; ii<sSolutions.GetSize(); ++ii)
+        if(sSolutions[ii].m_vStart.m_dSolutionValue < sSolutions[lBest].m_vStart.m_dSolutionValue)
+          { lBest = ii; }
+      m_dGap3d     = sSolutions[lBest].m_vStart.m_dSolutionValue;
+      m_vUVParam   = SmPoint2d(sSolutions[lBest].m_vStart[0],sSolutions[lBest].m_vStart[1]);
       m_bParamSet  = TRUE;
 
     } // end point classifies to a face branch
