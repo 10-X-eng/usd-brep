@@ -4152,16 +4152,37 @@ SmBoolean SmSurfOfExtrusion::AssertValid
   bRtn &= SM_ASSERT_VALUE_REPORT(7, SM_LEVEL_0, (m_vAnalUVDomain.GetUInterval().AreEqual(m_pGenCurve->GetSTEPInterval(),dTolU)), dTolU, SM_UNDEF_DOUBLE, _T("") ) ;
 
   // 4. check that m_vOrigin is a point on m_pGenCurve
+  // The inverse solver can miss even an exactly evaluated point on a
+  // quadratic generator. First prove membership by forward evaluation at
+  // the constructor's origin station and the possible trimmed endpoints.
+  // This uses the same geometric tolerance as the inverse query below.
+  SmBoolean bOriginOnCurve = FALSE ;
   SmSolutionArray sSolutions ;
-  m_pGenCurve->GlobalPointSolve(m_pGenCurve->GetNaturalInterval(),
+  SmPoint3d sOriginCandidate ;
+  const SmExtent1d sGenInterval = m_pGenCurve->GetNaturalInterval() ;
+  for(ULONG ii=0; ii<2 && !bOriginOnCurve; ++ii)
+    {
+      const double dParameter = ii ? sGenInterval.GetMax() : sGenInterval.GetMin() ;
+      if(m_pGenCurve->EvaluatePoint(dParameter, sOriginCandidate) == SM_SUCCESS)
+        bOriginOnCurve = (sOriginCandidate - m_vOrigin).Length() <= SM_EFF_ZERO ;
+    }
+  if(!bOriginOnCurve
+     && m_pGenCurve->EvaluateSTEP(m_pGenCurve->GetSTEPInterval().Evaluate(0.45678),
+                                  0, TRUE, &sOriginCandidate) == SM_SUCCESS)
+    bOriginOnCurve = (sOriginCandidate - m_vOrigin).Length() <= SM_EFF_ZERO ;
+  if(!bOriginOnCurve)
+    {
+      m_pGenCurve->GlobalPointSolve(m_pGenCurve->GetNaturalInterval(),
                                 SM_SO_INTERSECT,
                                 m_vOrigin,
                                 SM_EFF_ZERO,
                                 NULL, NULL,
                                 SM_SR_ALL,
-                                sSolutions) ;
+                                     sSolutions) ;
+      bOriginOnCurve = sSolutions.GetSize() > 0 ;
+    }
 
-  bRtn &= SM_ASSERT_BOOLEAN_REPORT(8, SM_LEVEL_0, (sSolutions.GetSize() > 0), _T("") ) ;
+  bRtn &= SM_ASSERT_BOOLEAN_REPORT(8, SM_LEVEL_0, bOriginOnCurve, _T("") ) ;
 
   // 5. Check cached m_vCurvePoint/m_vCurveVec information
   double   dAngleRad,  dDist, dNotUsed = 0.0 ;

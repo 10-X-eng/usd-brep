@@ -9,6 +9,9 @@
 #include "SmMath.h"
 #include "StdAfx.h"
 
+#include <limits>
+#include <memory>
+
 #include <nurbs.h>
 #include <SmFace.h>
 #include <SmVertex.h>
@@ -6064,7 +6067,49 @@ SmStatus SmFace::ComputePreciseProperties
     const SmPrecisePropertyLayout sLayout(lPropertyFlags);
     const ULONG lNumComponents = sLayout.m_lNumComponents;
     SmTArray<double> yscale(lNumComponents,NULL,lNumComponents);
-    for (ULONG iii=0; iii<yscale.GetSize(); iii++) { yscale[iii] = SM_BIG_DOUBLE; }
+    // Every requested property needs error control. An effectively infinite
+    // scale for moments/volume lets the area converge while those quantities
+    // remain inaccurate, even when the requested accuracy is tightened.
+    SmExtent3d sPropertyBounds;
+    SER(CalculateBoundingBox(sPropertyBounds));
+    const SmVector3d sLow = sPropertyBounds.GetMin() - crOriginOfComputation;
+    const SmVector3d sHigh = sPropertyBounds.GetMax() - crOriginOfComputation;
+    const SmVector3d sRadius(smos_Max(smos_Fabs(sLow.x), smos_Fabs(sHigh.x)),
+                              smos_Max(smos_Fabs(sLow.y), smos_Fabs(sHigh.y)),
+                              smos_Max(smos_Fabs(sLow.z), smos_Fabs(sHigh.z)));
+    const double dLengthScale = smos_Max(sRadius.Length(), SM_EFF_ZERO);
+    const double dAreaScale = smos_Max(smos_Fabs(dEstimatedArea)/10.0, SM_EFF_ZERO_SQ);
+    // Subtracting a distant origin after world-space evaluation introduces
+    // roundoff noise into moment integrands. Center a private surface before
+    // evaluation when that noise would exceed the requested local accuracy.
+    // UV trims and the caller's geometry remain unchanged.
+    const SmSurface *pIntegrationSurface = GetSurface();
+    SmPoint3d sIntegrationOrigin = crOriginOfComputation;
+    std::unique_ptr<SmSurface> sCenteredSurface;
+    if (crOriginOfComputation.Length()*std::numeric_limits<double>::epsilon()
+          > dDesiredAccuracy*dLengthScale/100.0)
+    {
+        SmSurface *pCopy = NULL;
+        const SmStatus eCopyStatus = GetSurface()->Copy(*GetContext(), pCopy);
+        sCenteredSurface.reset(pCopy);
+        SER(eCopyStatus);
+        const SmAxis2Placement sPlacement(-crOriginOfComputation,
+                                           SmVector3d(1,0,0), SmVector3d(0,1,0));
+        SER(sCenteredSurface->Transform(sPlacement));
+        pIntegrationSurface = sCenteredSurface.get();
+        sIntegrationOrigin.Set(0,0,0);
+    }
+    for (ULONG iii=0; iii<yscale.GetSize(); iii++) { yscale[iii] = dAreaScale; }
+    if (sLayout.m_lVolume) yscale[sLayout.m_lVolume-1] = dAreaScale*dLengthScale;
+    for (ULONG iMoment=0; iMoment<8; ++iMoment)
+    {
+        if (!sLayout.m_aMoments[iMoment]) continue;
+        double dScale = dAreaScale*dLengthScale;
+        if (iMoment != 0) dScale *= dLengthScale;
+        if (iMoment >= 5) dScale *= dLengthScale;
+        const ULONG lStart = sLayout.m_aMoments[iMoment]-1;
+        for (ULONG iAxis=0; iAxis<3; ++iAxis) yscale[lStart+iAxis] = dScale;
+    }
 
     double dSign = 1.0; // Note, if Thickness, don't return negative volumes.
     if ( eOrientation == SM_OT_SAME && dFaceThickness < SM_EFF_ZERO ) {
@@ -6088,10 +6133,10 @@ SmBoolean bDebugMe = FALSE;
                 sm_GraphicsLoop();
               }
 #endif // SM_DEBUG_CODE
-            yscale[0] = dEstimatedArea/10.0;
+            yscale[0] = dAreaScale;
 
-            SmODEAreaIFEO sAreaEval(*this->GetSurface(),*pBSC,GetUVDomain().GetMin().y,
-                dDesiredAccuracy/10.0,&yscale,crOriginOfComputation,dFaceThickness,sLayout);
+            SmODEAreaIFEO sAreaEval(*pIntegrationSurface,*pBSC,GetUVDomain().GetMin().y,
+                dDesiredAccuracy/10.0,&yscale,sIntegrationOrigin,dFaceThickness,sLayout);
             SmODEIntegrator sODE(sAreaEval);
             SmTArray<double> dY(lNumComponents,NULL,lNumComponents);
             SmExtent1d sIvl = pBSC->GetNaturalInterval();
