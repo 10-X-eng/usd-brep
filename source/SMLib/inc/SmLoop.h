@@ -117,6 +117,16 @@ public:
      double            & rdEdgeParam,     // out: only set when rtn value is SM_POC_ON_BOUNDARY
      SmOrientType    & eOrientation) ;    // out: only set when rtn value is SM_POC_INSIDE
 
+    // Measurement queries can request an independent classification accuracy.
+    // The five-argument entry retains the model-tolerance policy and ABI.
+    SmPointObjectContainmentType ContainsUVPoint
+    (const SmPoint2d & crUVPoint,
+     double dTol3d,
+     SmEdge * & rpOnEdge,
+     double & rdEdgeParam,
+     SmOrientType & eOrientation,
+     const double * pOptQueryAccuracy3d);
+
     // get Loop UVBoundary corners touching given UVDomain square - useful when loop is bounded by a surface singularity
     // rtn: SM_SS_NONE or orof:[SM_SS_UMIN SM_SS_VMIN SM_SS_UMAX SM_SS_VMAX]
     ULONG GetUVCornerBoundaries(const SmExtent2d   & crUVDomain,   // in : UVDomain to test double

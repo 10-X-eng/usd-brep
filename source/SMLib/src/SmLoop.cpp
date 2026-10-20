@@ -512,6 +512,17 @@ SmPointObjectContainmentType SmLoop::ContainsUVPoint // rtn: oneof SM_POC_INSIDE
   SmEdge          * & rpOnEdge,                      // out: only set when rtn value is SM_POC_ON_BOUNDARY
   double            & rdEdgeParam,                   // out: only set when rtn value is SM_POC_ON_BOUNDARY
   SmOrientType      & eOrientation)                  // out: only set when rtn value is SM_POC_INSIDE
+{
+  return ContainsUVPoint(crUVPoint, dTol3d, rpOnEdge, rdEdgeParam, eOrientation, NULL);
+}
+
+SmPointObjectContainmentType SmLoop::ContainsUVPoint
+ (const SmPoint2d & crUVPoint,
+  double dTol3d,
+  SmEdge * & rpOnEdge,
+  double & rdEdgeParam,
+  SmOrientType & eOrientation,
+  const double * pOptQueryAccuracy3d)
 {    
   SM_REF1(dTol3d) ; 
   // Init outputs:
@@ -547,7 +558,10 @@ SmPointObjectContainmentType SmLoop::ContainsUVPoint // rtn: oneof SM_POC_INSIDE
 
   // Get a tolerance in uv space.
   // Scale the input tolerance by the UV deriv size.
-  SmZoneTol3d sZoneTol3d = SmTol::GetZoneTol3d( pSurface ); 
+  if (pOptQueryAccuracy3d && !(*pOptQueryAccuracy3d > 0.0 && *pOptQueryAccuracy3d < SM_BIG_DOUBLE))
+    return SM_POC_UNKNOWN;
+  SmZoneTol3d sZoneTol3d = pOptQueryAccuracy3d
+    ? SmZoneTol3d(*pOptQueryAccuracy3d) : SmTol::GetZoneTol3d( pSurface );
   SmTol2d sTolUV = SmTol::MapTo2d( sZoneTol3d, crUVPoint, *pSurface );
   double dTolUV = sTolUV.val;
   //SmPoint3d sSrfPt;
@@ -751,7 +765,8 @@ SmBoolean bDebugMe = FALSE ;
       pThisEU = apEUs[ idx ];
       SmEdge  *pEdge = pThisEU->GetEdge();
       SmCurve *pEdgeCurve = pEdge->GetCurve();
-      SmZoneTol3d sEdgeZoneTol3d = SmTol::GetZoneTol3d( pThisEU->GetEdge() );
+      SmZoneTol3d sEdgeZoneTol3d = pOptQueryAccuracy3d
+        ? SmZoneTol3d(*pOptQueryAccuracy3d) : SmTol::GetZoneTol3d( pThisEU->GetEdge() );
       double dParam, dDist;
       SmBoolean bSuccess;
 

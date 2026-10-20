@@ -3,6 +3,18 @@
 
 # Query Operations
 
+## Kernel maintainer note: measurement classification
+
+`SmLoop::ContainsUVPoint` has an additional six-argument overload accepting a
+`const double*` with a finite positive query accuracy in model units. It applies
+that accuracy to both the preliminary 3D edge hit and the mapped UV containment
+test, without changing the model's stored tolerances. A null pointer retains the
+model-tolerance policy; invalid explicit accuracy returns `SM_POC_UNKNOWN`.
+The original five-argument entry and its ABI retain their existing policy.
+UV mapping still has the implementation's numerical floors and singularity
+limits; an accuracy request is not a certified global error bound. This is a
+kernel maintainer interface, not an additional `SmApi*` or Python function.
+
 **Source:** `source/SM_API/inc/SmApiQueries.h`, `source/SM_API/inc/SmApiSurfaces.h`, `source/SM_API/inc/SmApiCurves.h`
 **Python (flat):** `brep_closest_point`, `brep_closest_point_all`, `curve_closest_point`, `curve_closest_point_all`, `surface_closest_point`, `is_manifold_solid`, `material_census`, `compute_volume`, `brep_relationship`, `brep_distance`, `get_closest_point`, `get_edges_via_api`, `get_faces_via_api`, `find_edge`, `find_face`, `evaluate_curve`, `evaluate_surface_point`, `evaluate_surface_normal`, `evaluate_surface_derivatives`, `brep_bounding_box`, `brep_copy`, `face_bounding_box`, `face_area`, `edge_bounding_box`, `edge_length`, `vertex_point`
 **Python (methods):** `Brep.{info, bounding_box, center, volume, mass_properties, distance_to, relationship_to, is_manifold_solid, material_census, copy, face_count, edge_count, vertex_count, faces, edges, vertices}`; `Face.{bounding_box, area, surface, uv_domain, edges, vertices, outer_loop_edges, boundary_loops, boundary_outer_loop, point_at_uv, normal_at_uv, outward_normal_at_uv, interior_point, classify_uv, closest_point, centroid, brep}`; `Edge.{bounding_box, length, curve, start_vertex, end_vertex, vertices, other_vertex, faces, point_at, closest_point, parameter_range, classify_parameter, tangent_at, brep}`; `Vertex.{point, edges, faces, brep}`; `Curve.{parameter_range, start_point, end_point, evaluate, length, is_closed, is_planar}`; `Surface.{u_domain, v_domain, uv_domain, evaluate, normal, derivatives, is_planar, is_periodic_u, is_periodic_v}`
